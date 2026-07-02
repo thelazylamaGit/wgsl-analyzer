@@ -5,13 +5,9 @@
 You can use folding regions with comment syntax such as:
 
 ```wgsl
-// region: Setup
+// region: Update
 // ...
 // endregion
-
-// #region Update
-// ...
-// #endregion
 ```
 
 ## VS Code

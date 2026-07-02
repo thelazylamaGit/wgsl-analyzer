@@ -11,15 +11,33 @@ use syntax::{
     match_ast,
 };
 
-const REGION_STARTS: &[&str] = &["// region:", "//#region", "// #region"];
-const REGION_ENDS: &[&str] = &["// endregion", "//#endregion", "// #endregion"];
-
 fn is_region_start(text: &str) -> bool {
-    REGION_STARTS.iter().any(|marker| text.starts_with(marker))
+    is_region_marker(text, "region")
 }
 
 fn is_region_end(text: &str) -> bool {
-    REGION_ENDS.iter().any(|marker| text.starts_with(marker))
+    is_region_marker(text, "endregion")
+}
+
+fn is_region_marker(
+    text: &str,
+    marker: &str,
+) -> bool {
+    let text = text.trim_start();
+    let text = if let Some(text) = text.strip_prefix("//") {
+        text
+    } else if let Some(text) = text.strip_prefix("/*") {
+        text
+    } else {
+        return false;
+    };
+
+    let text = text.trim_start();
+    let text = text.strip_suffix("*/").map(str::trim_end).unwrap_or(text);
+    let text = text.strip_prefix('#').map(str::trim_start).unwrap_or(text);
+    text.strip_prefix(marker).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace)
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
