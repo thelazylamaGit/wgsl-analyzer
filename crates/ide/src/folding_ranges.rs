@@ -33,8 +33,8 @@ fn is_region_marker(
     };
 
     let text = text.trim_start();
-    let text = text.strip_suffix("*/").map(str::trim_end).unwrap_or(text);
-    let text = text.strip_prefix('#').map(str::trim_start).unwrap_or(text);
+    let text = text.strip_suffix("*/").map_or(text, str::trim_end);
+    let text = text.strip_prefix('#').map_or(text, str::trim_start);
     text.strip_prefix(marker).is_some_and(|rest| {
         rest.is_empty() || rest.starts_with(':') || rest.starts_with(char::is_whitespace)
     })
