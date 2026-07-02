@@ -5,7 +5,7 @@
 	"private": true,
 	"icon": "icon.png",
 	"version": "0.13.0-dev",
-	"releaseTag": "nightly",
+	"releaseTag": null,
 	"publisher": "wgsl-analyzer",
 	"type": "commonjs",
 	"repository": {
