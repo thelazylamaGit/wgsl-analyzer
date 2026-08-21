@@ -3,7 +3,6 @@
 #[cfg(test)]
 mod fixture;
 
-pub mod diagnostics;
 mod folding_ranges;
 mod formatting;
 mod goto_definition;
@@ -22,20 +21,18 @@ mod view_syntax_tree;
 use std::panic;
 
 use base_db::{
-    EditionedFileId, FilePosition, FileRange, FileSet, RangeInfo, SourceDatabase as _, SourceRoot,
-    TextRange, change::Change, input::SourceRootId,
+    CapabilitiesInput, EditionedFileId, FilePosition, FileRange, FileSet, RangeInfo,
+    SourceDatabase as _, SourceRoot, TextRange, change::Change, input::SourceRootId,
 };
-use diagnostics::Diagnostic;
-use hir::diagnostics::DiagnosticsConfig;
-use hir_def::database::DefDatabase as _;
 use ide_completion::{CompletionConfig, item::CompletionItem};
-use ide_db::LineIndexDatabase as _;
+use ide_db::line_index;
+use ide_diagnostics::{Diagnostic, DiagnosticsConfig};
 pub use line_index::{LineCol, LineIndex};
 use rustc_hash::FxHashMap;
-use salsa::{Cancelled, Database as _, Durability};
-use syntax::{Edition, ExtensionsConfig, Parse, SyntaxNode};
+use salsa::{Cancelled, Database as _};
+use syntax::{Capabilities, ExtensionsConfig, Parse, SyntaxNode};
 use triomphe::Arc;
-use vfs::{AbsPathBuf, FileId, VfsPath};
+use vfs::{FileId, VfsPath};
 
 use crate::signature_help::SignatureHelp;
 pub use crate::{
@@ -124,48 +121,47 @@ pub use ide_db::{
 
 #[derive(Debug)]
 pub struct AnalysisHost {
-    database: RootDatabase,
+    db: RootDatabase,
 }
 
 impl AnalysisHost {
     #[must_use]
     pub fn new(lru_capacity: Option<u16>) -> Self {
         Self {
-            database: RootDatabase::new(lru_capacity),
+            db: RootDatabase::new(lru_capacity),
         }
     }
 
-    pub const fn with_database(database: RootDatabase) -> Self {
-        Self { database }
+    pub const fn with_database(db: RootDatabase) -> Self {
+        Self { db }
     }
 
     pub const fn update_lru_capacity(
         &mut self,
         lru_capacity: Option<u16>,
     ) {
-        self.database.update_base_query_lru_capacities(lru_capacity);
+        self.db.update_base_query_lru_capacities(lru_capacity);
     }
 
     pub const fn update_lru_capacities(
         &mut self,
         lru_capacities: &FxHashMap<Box<str>, u16>,
     ) {
-        self.database.update_lru_capacities(lru_capacities);
+        self.db.update_lru_capacities(lru_capacities);
     }
 
-    pub fn update_extensions(
+    pub fn update_capabilities(
         &mut self,
-        extensions: ExtensionsConfig,
+        capabilities: Capabilities,
     ) {
-        self.database
-            .set_extensions_with_durability(extensions, Durability::MEDIUM);
+        CapabilitiesInput::update_capabilities(&mut self.db, capabilities);
     }
 
     /// Returns a snapshot of the current state, which you can query for
     /// semantic information.
     pub fn analysis(&self) -> Analysis {
         Analysis {
-            database: self.database.clone(),
+            db: self.db.clone(),
         }
     }
 
@@ -175,23 +171,23 @@ impl AnalysisHost {
         &mut self,
         change: Change,
     ) {
-        self.database.apply_change(change);
+        self.db.apply_change(change);
     }
 
     pub fn trigger_cancellation(&mut self) {
-        self.database.trigger_cancellation();
+        self.db.trigger_cancellation();
     }
 
     pub fn trigger_garbage_collection(&mut self) {
-        self.database.trigger_lru_eviction();
+        self.db.trigger_lru_eviction();
     }
 
     pub const fn raw_database(&self) -> &RootDatabase {
-        &self.database
+        &self.db
     }
 
     pub const fn raw_database_mut(&mut self) -> &mut RootDatabase {
-        &mut self.database
+        &mut self.db
     }
 }
 
@@ -202,7 +198,7 @@ impl Default for AnalysisHost {
 }
 
 pub struct Analysis {
-    database: RootDatabase,
+    db: RootDatabase,
 }
 
 // As a general design guideline, `Analysis` API are intended to be independent
@@ -241,7 +237,7 @@ impl Analysis {
     where
         Function: FnOnce(&RootDatabase) -> T + panic::UnwindSafe,
     {
-        Cancelled::catch(|| function(&self.database))
+        Cancelled::catch(|| function(&self.db))
     }
 
     /// Debug info about the current state of the analysis.
@@ -249,14 +245,14 @@ impl Analysis {
         &self,
         file_id: Option<FileId>,
     ) -> Cancellable<String> {
-        self.with_db(|database| status::status(database, file_id))
+        self.with_db(|db| status::status(db, file_id))
     }
 
     pub fn source_root_id(
         &self,
         file_id: FileId,
     ) -> Cancellable<SourceRootId> {
-        self.with_db(|database| database.file_source_root(file_id).source_root_id(database))
+        self.with_db(|db| db.file_source_root(file_id).source_root_id(db))
     }
 
     /// Computes the set of parser level diagnostics for the given file.
@@ -293,7 +289,7 @@ impl Analysis {
         &self,
         file_id: FileId,
     ) -> Cancellable<Arc<str>> {
-        self.with_db(|database| database.file_text(file_id).text(database).clone())
+        self.with_db(|db| db.file_text(file_id).text(db).clone())
     }
 
     /// Returns the full source code with imports resolved.
@@ -301,7 +297,7 @@ impl Analysis {
         &self,
         file_id: FileId,
     ) -> Cancellable<Result<String, ()>> {
-        self.with_db(|database| Ok(database.file_text(file_id).text(database).to_string()))
+        self.with_db(|db| Ok(db.file_text(file_id).text(db).to_string()))
     }
 
     /// Gets the syntax tree of the file.
@@ -309,7 +305,7 @@ impl Analysis {
         &self,
         file_id: FileId,
     ) -> Cancellable<Parse> {
-        self.with_db(|database| EditionedFileId::from_file(database, file_id).parse(database))
+        self.with_db(|db| EditionedFileId::from_file(db, file_id).parse(db))
     }
 
     /// Renders the module graph to `GraphViz` "dot" syntax.
@@ -317,7 +313,7 @@ impl Analysis {
         &self,
         file_id: FileId,
     ) -> Cancellable<Option<String>> {
-        self.with_db(|database| view_module_graph::view_module_graph(database, file_id))
+        self.with_db(|db| view_module_graph::view_module_graph(db, file_id))
     }
 
     /// Renders the package graph to `GraphViz` "dot" syntax.
@@ -325,21 +321,21 @@ impl Analysis {
         &self,
         full: bool,
     ) -> Cancellable<String> {
-        self.with_db(|database| view_package_graph::view_package_graph(database, full))
+        self.with_db(|db| view_package_graph::view_package_graph(db, full))
     }
 
     pub fn line_index(
         &self,
         file_id: FileId,
     ) -> Cancellable<Arc<LineIndex>> {
-        self.with_db(|database| database.line_index(file_id))
+        self.with_db(|db| line_index(db, file_id).clone())
     }
 
     pub fn view_syntax_tree(
         &self,
         file_id: FileId,
     ) -> Cancellable<String> {
-        self.with_db(|database| view_syntax_tree::view_syntax_tree(database, file_id))
+        self.with_db(|db| view_syntax_tree::view_syntax_tree(db, file_id))
     }
 
     /// Returns a list of the places in the file where type hints can be displayed.
@@ -349,7 +345,7 @@ impl Analysis {
         file_id: FileId,
         range: Option<TextRange>,
     ) -> Cancellable<Vec<InlayHint>> {
-        self.with_db(|database| inlay_hints::inlay_hints(database, file_id, range, config))
+        self.with_db(|db| inlay_hints::inlay_hints(db, file_id, range, config))
     }
 
     /// Returns the set of folding ranges.
@@ -357,11 +353,9 @@ impl Analysis {
         &self,
         file_id: FileId,
     ) -> Cancellable<Vec<Fold>> {
-        self.with_db(|database| {
+        self.with_db(|db| {
             folding_ranges::folding_ranges(
-                &EditionedFileId::from_file(database, file_id)
-                    .parse(database)
-                    .tree(),
+                &EditionedFileId::from_file(db, file_id).parse(db).tree(),
             )
         })
     }
@@ -371,14 +365,14 @@ impl Analysis {
         config: &DiagnosticsConfig,
         file_id: FileId,
     ) -> Cancellable<Vec<Diagnostic>> {
-        self.with_db(|database| diagnostics::diagnostics(database, config, file_id))
+        self.with_db(|db| ide_diagnostics::diagnostics(db, config, file_id))
     }
 
     pub fn goto_definition(
         &self,
         file_position: FilePosition,
     ) -> Cancellable<Option<RangeInfo<NavigationTarget>>> {
-        self.with_db(|database| goto_definition::goto_definition(database, file_position))
+        self.with_db(|db| goto_definition::goto_definition(db, file_position))
     }
 
     /// Computes completions at the given position.
@@ -388,9 +382,8 @@ impl Analysis {
         position: FilePosition,
         trigger_character: Option<char>,
     ) -> Cancellable<Option<Vec<CompletionItem>>> {
-        self.with_db(|database| {
-            ide_completion::completions2(database, config, position, trigger_character)
-        })
+        let _p = tracing::info_span!("Analysis::completions").entered();
+        self.with_db(|db| ide_completion::completions(db, config, position, trigger_character))
     }
 
     pub fn format(
@@ -398,7 +391,7 @@ impl Analysis {
         file_id: FileId,
         range: Option<TextRange>,
     ) -> Cancellable<Option<SyntaxNode>> {
-        self.with_db(|database| formatting::format(database, file_id, range))
+        self.with_db(|db| formatting::format(db, file_id, range))
     }
 
     /// Returns a short text describing element at position.
@@ -407,13 +400,13 @@ impl Analysis {
         config: &HoverConfig,
         range: FileRange,
     ) -> Cancellable<Option<RangeInfo<HoverResult>>> {
-        self.with_db(|database| hover::hover(database, range, config))
+        self.with_db(|db| hover::hover(db, range, config))
     }
 
     pub fn signature_help(
         &self,
         position: FilePosition,
     ) -> Cancellable<Option<SignatureHelp>> {
-        self.with_db(|database| signature_help::signature_help(database, position))
+        self.with_db(|db| signature_help::signature_help(db, position))
     }
 }

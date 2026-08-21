@@ -1,51 +1,52 @@
 //! A high-level object-oriented access to code.
+#![warn(unused)]
 
-pub mod database;
+pub mod db;
 pub mod definition;
 pub mod diagnostics;
 
-use base_db::{EditionedFileId, Intern as _, Lookup as _};
-use diagnostics::{AnyDiagnostic, DiagnosticsConfig};
+use base_db::{EditionedFileId, Intern as _, Lookup as _, SourceDatabase};
+use diagnostics::AnyDiagnostic;
 use either::Either;
 use hir_def::{
-    HasSource as _, InFile,
-    body::{BindingId, Body, BodySourceMap},
-    database::{
-        DefDatabase, DefinitionWithBodyId, FunctionId, GlobalAssertStatementId, GlobalConstantId,
+    AstIdMap, HasSource as _, InFile,
+    body::{BindingId, Body, BodySourceMap, scope::ExprScopes},
+    db::{
+        DefinitionWithBodyId, FunctionId, GlobalAssertStatementId, GlobalConstantId,
         GlobalVariableId, ImportId, Location, OverrideId, StructId, TypeAliasId,
     },
     expression::{ExpressionId, StatementId},
-    expression_store::{ExpressionStoreSource, path::Path},
+    expression_store::{ExpressionStore, ExpressionStoreOwnerId, ExpressionStoreSource},
     item_scope::ItemScope,
-    item_tree::{self, ItemTree, ModuleItemId, Name},
-    resolver::{ResolveKind, Resolver},
-    signature::{FieldId, ParameterId},
+    item_tree::{ItemTree, ModuleItemId},
+    resolver::Resolver,
+    signature::{FieldId, FunctionSignature, ParameterId, StructSignature, TypeAliasSignature},
 };
-pub use hir_ty::database::HirDatabase;
 use hir_ty::{infer::InferenceResult, ty::Type};
 use smallvec::SmallVec;
 use stdx::impl_from;
 use syntax::{AstNode as _, HasName as _, SyntaxNode, ast, pointer::AstPointer};
-use triomphe::Arc;
+
+pub use hir_ty::{AddressSpace, db::HirDatabase};
 
 pub trait HasSource {
     type Ast;
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>>;
 }
 
 type ExprOrStatement = Either<ast::Expression, ast::Statement>;
 
 /// Nice API on top of the layers below.
-pub struct Semantics<'database> {
-    pub database: &'database dyn HirDatabase,
+pub struct Semantics<'db> {
+    pub db: &'db dyn HirDatabase,
 }
 
-impl<'database> Semantics<'database> {
-    pub fn new(database: &'database dyn HirDatabase) -> Self {
-        Semantics { database }
+impl<'db> Semantics<'db> {
+    pub fn new(db: &'db dyn HirDatabase) -> Self {
+        Semantics { db }
     }
 
     #[must_use]
@@ -53,15 +54,15 @@ impl<'database> Semantics<'database> {
         &self,
         file_id: EditionedFileId,
     ) -> ast::SourceFile {
-        file_id.parse(self.database).tree()
+        file_id.parse(self.db).tree()
     }
 
     #[must_use]
     pub fn analyze(
         &self,
         definition: DefinitionWithBodyId,
-    ) -> SourceAnalyzer<'_> {
-        SourceAnalyzer::new(self.database, definition)
+    ) -> SourceAnalyzer<'db> {
+        SourceAnalyzer::new(self.db, definition)
     }
 
     /// Finds the root level container for a given node.
@@ -76,74 +77,84 @@ impl<'database> Semantics<'database> {
             .find_map(|syntax| -> Option<ChildContainer> {
                 let item = ast::Item::cast(syntax)?;
                 let is_in_body = is_node_in_body(source, &item);
-
-                let container: ChildContainer = match item {
-                    ast::Item::ImportStatement(import) => {
-                        let definition = self.import_to_def(&InFile::new(file_id, import))?;
-                        ChildContainer::ImportId(definition)
-                    },
-                    ast::Item::FunctionDeclaration(function_declaration) => {
-                        let definition =
-                            self.function_to_def(&InFile::new(file_id, function_declaration))?;
-                        if is_in_body {
-                            DefinitionWithBodyId::Function(definition).into()
-                        } else {
-                            ChildContainer::FunctionId(definition)
-                        }
-                    },
-                    ast::Item::VariableDeclaration(variable_declaration) => {
-                        let definition = self
-                            .global_variable_to_def(&InFile::new(file_id, variable_declaration))?;
-                        if is_in_body {
-                            DefinitionWithBodyId::GlobalVariable(definition).into()
-                        } else {
-                            ChildContainer::GlobalVariableId(definition)
-                        }
-                    },
-                    ast::Item::ConstantDeclaration(constant_declaration) => {
-                        let definition = self
-                            .global_constant_to_def(&InFile::new(file_id, constant_declaration))?;
-                        if is_in_body {
-                            DefinitionWithBodyId::GlobalConstant(definition).into()
-                        } else {
-                            ChildContainer::GlobalConstantId(definition)
-                        }
-                    },
-                    ast::Item::OverrideDeclaration(override_declaration) => {
-                        let definition = self
-                            .global_override_to_def(&InFile::new(file_id, override_declaration))?;
-                        if is_in_body {
-                            DefinitionWithBodyId::Override(definition).into()
-                        } else {
-                            ChildContainer::OverrideId(definition)
-                        }
-                    },
-                    ast::Item::TypeAliasDeclaration(type_alias_declaration) => {
-                        let definition = self.global_type_alias_to_def(&InFile::new(
-                            file_id,
-                            type_alias_declaration,
-                        ))?;
-                        ChildContainer::TypeAliasId(definition)
-                    },
-                    ast::Item::StructDeclaration(struct_declaration) => {
-                        let definition =
-                            self.global_struct_to_def(&InFile::new(file_id, struct_declaration))?;
-                        ChildContainer::StructId(definition)
-                    },
-                    ast::Item::AssertStatement(assert_statement) => {
-                        let definition = self.global_assert_statement_to_def(&InFile::new(
-                            file_id,
-                            assert_statement,
-                        ))?;
-                        if is_in_body {
-                            DefinitionWithBodyId::GlobalAssertStatement(definition).into()
-                        } else {
-                            ChildContainer::GlobalAssertStatementId(definition)
-                        }
-                    },
-                };
+                let container = self.item_to_container(file_id, item, is_in_body)?;
                 Some(container)
             })
+    }
+
+    fn item_to_container(
+        &self,
+        file_id: EditionedFileId,
+        item: ast::Item,
+        is_in_body: bool,
+    ) -> Option<ChildContainer> {
+        let child_container = match item {
+            ast::Item::ImportStatement(import) => {
+                let definition = self.import_to_def(&InFile::new(file_id, import))?;
+                ChildContainer::ImportId(definition)
+            },
+            ast::Item::FunctionDeclaration(function_declaration) => {
+                let definition =
+                    self.function_to_def(&InFile::new(file_id, function_declaration))?;
+                if is_in_body {
+                    DefinitionWithBodyId::Function(definition).into()
+                } else {
+                    ChildContainer::FunctionId(definition)
+                }
+            },
+            ast::Item::VariableDeclaration(variable_declaration) => {
+                let definition =
+                    self.global_variable_to_def(&InFile::new(file_id, variable_declaration))?;
+                if is_in_body {
+                    DefinitionWithBodyId::GlobalVariable(definition).into()
+                } else {
+                    ChildContainer::GlobalVariableId(definition)
+                }
+            },
+            ast::Item::ConstantDeclaration(constant_declaration) => {
+                let definition =
+                    self.global_constant_to_def(&InFile::new(file_id, constant_declaration))?;
+                if is_in_body {
+                    DefinitionWithBodyId::GlobalConstant(definition).into()
+                } else {
+                    ChildContainer::GlobalConstantId(definition)
+                }
+            },
+            ast::Item::OverrideDeclaration(override_declaration) => {
+                let definition =
+                    self.global_override_to_def(&InFile::new(file_id, override_declaration))?;
+                if is_in_body {
+                    DefinitionWithBodyId::Override(definition).into()
+                } else {
+                    ChildContainer::OverrideId(definition)
+                }
+            },
+            ast::Item::TypeAliasDeclaration(type_alias_declaration) => {
+                let definition =
+                    self.global_type_alias_to_def(&InFile::new(file_id, type_alias_declaration))?;
+                ChildContainer::TypeAliasId(definition)
+            },
+            ast::Item::StructDeclaration(struct_declaration) => {
+                let definition =
+                    self.global_struct_to_def(&InFile::new(file_id, struct_declaration))?;
+                ChildContainer::StructId(definition)
+            },
+            ast::Item::AssertStatement(assert_statement) => {
+                let definition =
+                    self.global_assert_statement_to_def(&InFile::new(file_id, assert_statement))?;
+                if is_in_body {
+                    DefinitionWithBodyId::GlobalAssertStatement(definition).into()
+                } else {
+                    ChildContainer::GlobalAssertStatementId(definition)
+                }
+            },
+            ast::Item::GlobalCompoundDeclaration(global_compound_declaration) => {
+                global_compound_declaration
+                    .items()
+                    .find_map(|item| self.item_to_container(file_id, item, is_in_body))?
+            },
+        };
+        Some(child_container)
     }
 
     #[must_use]
@@ -151,19 +162,17 @@ impl<'database> Semantics<'database> {
         &self,
         file_id: EditionedFileId,
         source: &SyntaxNode,
-    ) -> Resolver {
+    ) -> Resolver<'db> {
         if let Some(definition) = self.find_container(file_id, source) {
             match definition {
-                ChildContainer::DefinitionWithBodyId(
-                    id @ DefinitionWithBodyId::Function(function_id),
-                ) => {
+                ChildContainer::DefinitionWithBodyId(id @ DefinitionWithBodyId::Function(_)) => {
                     if let Some(nearest_scope) = nearest_scope(source) {
                         self.analyze(id).resolver_for(nearest_scope)
                     } else {
-                        id.resolver(self.database)
+                        id.resolver(self.db)
                     }
                 },
-                ChildContainer::DefinitionWithBodyId(id) => id.resolver(self.database),
+                ChildContainer::DefinitionWithBodyId(id) => id.resolver(self.db),
                 ChildContainer::ImportId(_)
                 | ChildContainer::FunctionId(_)
                 | ChildContainer::GlobalVariableId(_)
@@ -172,13 +181,13 @@ impl<'database> Semantics<'database> {
                 | ChildContainer::StructId(_)
                 | ChildContainer::GlobalAssertStatementId(_)
                 | ChildContainer::TypeAliasId(_) => {
-                    let file_id = definition.file_id(self.database);
-                    let module_info = ItemScope::of(self.database, file_id);
+                    let file_id = definition.file_id(self.db);
+                    let module_info = ItemScope::of(self.db, file_id);
                     Resolver::new(file_id, module_info)
                 },
             }
         } else {
-            let module_info = ItemScope::of(self.database, file_id);
+            let module_info = ItemScope::of(self.db, file_id);
             Resolver::new(file_id, module_info)
         }
     }
@@ -196,72 +205,72 @@ impl<'database> Semantics<'database> {
         &self,
         source: &InFile<ast::ImportStatement>,
     ) -> Option<ImportId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn function_to_def(
         &self,
         source: &InFile<ast::FunctionDeclaration>,
     ) -> Option<FunctionId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_constant_to_def(
         &self,
         source: &InFile<ast::ConstantDeclaration>,
     ) -> Option<GlobalConstantId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_variable_to_def(
         &self,
         source: &InFile<ast::VariableDeclaration>,
     ) -> Option<GlobalVariableId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_override_to_def(
         &self,
         source: &InFile<ast::OverrideDeclaration>,
     ) -> Option<OverrideId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_type_alias_to_def(
         &self,
         source: &InFile<ast::TypeAliasDeclaration>,
     ) -> Option<TypeAliasId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_struct_to_def(
         &self,
         source: &InFile<ast::StructDeclaration>,
     ) -> Option<StructId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 
     fn global_assert_statement_to_def(
         &self,
         source: &InFile<ast::AssertStatement>,
     ) -> Option<GlobalAssertStatementId> {
-        let ast_id_map = self.database.ast_id_map(source.file_id);
+        let ast_id_map = AstIdMap::of(self.db, source.file_id);
         let id = ast_id_map.try_ast_id(&source.value)?;
-        Some(Location::new(source.file_id, id).intern(self.database))
+        Some(Location::new(source.file_id, id).intern(self.db))
     }
 }
 
@@ -282,49 +291,36 @@ fn is_node_in_body(
     node: &SyntaxNode,
     item: &ast::Item,
 ) -> bool {
+    let child_offset = node.text_range().start();
     match item {
-        ast::Item::FunctionDeclaration(function_declaration) => {
-            let child_offset = node.text_range().start();
-
-            function_declaration
-                .body()
-                .is_some_and(|compound_statement| {
-                    compound_statement
-                        .syntax()
-                        .text_range()
-                        .contains(child_offset)
-                })
-        },
-        ast::Item::VariableDeclaration(variable_declaration) => {
-            let child_offset = node.text_range().start();
-
-            variable_declaration
-                .init()
-                .is_some_and(|expression| expression.syntax().text_range().contains(child_offset))
-        },
-        ast::Item::ConstantDeclaration(constant_declaration) => {
-            let child_offset = node.text_range().start();
-
-            constant_declaration
-                .init()
-                .is_some_and(|expression| expression.syntax().text_range().contains(child_offset))
-        },
-        ast::Item::OverrideDeclaration(override_declaration) => {
-            let child_offset = node.text_range().start();
-
-            override_declaration
-                .init()
-                .is_some_and(|expression| expression.syntax().text_range().contains(child_offset))
-        },
-        ast::Item::AssertStatement(assert_statement) => {
-            let child_offset = node.text_range().start();
-            assert_statement
-                .expression()
-                .is_some_and(|expression| expression.syntax().text_range().contains(child_offset))
-        },
+        ast::Item::FunctionDeclaration(function_declaration) => function_declaration
+            .body()
+            .is_some_and(|compound_statement| {
+                compound_statement
+                    .syntax()
+                    .text_range()
+                    .contains(child_offset)
+            }),
+        ast::Item::VariableDeclaration(variable_declaration) => variable_declaration
+            .init()
+            .is_some_and(|expression| expression.syntax().text_range().contains(child_offset)),
+        ast::Item::ConstantDeclaration(constant_declaration) => constant_declaration
+            .init()
+            .is_some_and(|expression| expression.syntax().text_range().contains(child_offset)),
+        ast::Item::OverrideDeclaration(override_declaration) => override_declaration
+            .init()
+            .is_some_and(|expression| expression.syntax().text_range().contains(child_offset)),
+        ast::Item::AssertStatement(assert_statement) => assert_statement
+            .expression()
+            .is_some_and(|expression| expression.syntax().text_range().contains(child_offset)),
         ast::Item::ImportStatement(_)
         | ast::Item::TypeAliasDeclaration(_)
         | ast::Item::StructDeclaration(_) => false,
+        ast::Item::GlobalCompoundDeclaration(global_compound_declaration) => {
+            global_compound_declaration
+                .items()
+                .any(|item| is_node_in_body(node, &item))
+        },
     }
 }
 
@@ -358,18 +354,18 @@ impl_from!(
 impl ChildContainer {
     pub fn file_id(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> EditionedFileId {
         match self {
-            Self::DefinitionWithBodyId(id) => id.file_id(database),
-            Self::ImportId(id) => id.lookup(database).file_id,
-            Self::FunctionId(id) => id.lookup(database).file_id,
-            Self::GlobalVariableId(id) => id.lookup(database).file_id,
-            Self::GlobalConstantId(id) => id.lookup(database).file_id,
-            Self::OverrideId(id) => id.lookup(database).file_id,
-            Self::StructId(id) => id.lookup(database).file_id,
-            Self::TypeAliasId(id) => id.lookup(database).file_id,
-            Self::GlobalAssertStatementId(id) => id.lookup(database).file_id,
+            Self::DefinitionWithBodyId(id) => id.file_id(db),
+            Self::ImportId(id) => id.lookup(db).file_id,
+            Self::FunctionId(id) => id.lookup(db).file_id,
+            Self::GlobalVariableId(id) => id.lookup(db).file_id,
+            Self::GlobalConstantId(id) => id.lookup(db).file_id,
+            Self::OverrideId(id) => id.lookup(db).file_id,
+            Self::StructId(id) => id.lookup(db).file_id,
+            Self::TypeAliasId(id) => id.lookup(db).file_id,
+            Self::GlobalAssertStatementId(id) => id.lookup(db).file_id,
         }
     }
 
@@ -384,44 +380,37 @@ impl ChildContainer {
 }
 
 fn module_item_to_def(
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     file_id: EditionedFileId,
     module_item: ModuleItemId,
 ) -> SmallVec<[ModuleDef; 1]> {
     let definition = match module_item {
         ModuleItemId::Function(function) => {
-            let location = Location::new(file_id, function);
-            let id = database.intern_function(location);
+            let id = Location::new(file_id, function).intern(db);
             ModuleDef::Function(Function { id })
         },
         ModuleItemId::Struct(r#struct) => {
-            let location = Location::new(file_id, r#struct);
-            let id = database.intern_struct(location);
+            let id = Location::new(file_id, r#struct).intern(db);
             ModuleDef::Struct(Struct { id })
         },
         ModuleItemId::GlobalVariable(variable) => {
-            let location = Location::new(file_id, variable);
-            let id = database.intern_global_variable(location);
+            let id = Location::new(file_id, variable).intern(db);
             ModuleDef::GlobalVariable(GlobalVariable { id })
         },
         ModuleItemId::GlobalConstant(constant) => {
-            let location = Location::new(file_id, constant);
-            let id = database.intern_global_constant(location);
+            let id = Location::new(file_id, constant).intern(db);
             ModuleDef::GlobalConstant(GlobalConstant { id })
         },
         ModuleItemId::Override(constant) => {
-            let location = Location::new(file_id, constant);
-            let id = database.intern_override(location);
+            let id = Location::new(file_id, constant).intern(db);
             ModuleDef::Override(Override { id })
         },
         ModuleItemId::TypeAlias(type_alias) => {
-            let location = Location::new(file_id, type_alias);
-            let id = database.intern_type_alias(location);
+            let id = Location::new(file_id, type_alias).intern(db);
             ModuleDef::TypeAlias(TypeAlias { id })
         },
         ModuleItemId::GlobalAssertStatement(global_assert_statement) => {
-            let location = Location::new(file_id, global_assert_statement);
-            let id = database.intern_global_assert_statement(location);
+            let id = Location::new(file_id, global_assert_statement).intern(db);
             ModuleDef::GlobalAssertStatement(GlobalAssertStatement { id })
         },
         ModuleItemId::ImportStatement(_) => return smallvec::SmallVec::new(),
@@ -429,23 +418,23 @@ fn module_item_to_def(
     smallvec::smallvec![definition]
 }
 
-pub struct SourceAnalyzer<'database> {
-    pub database: &'database dyn HirDatabase,
-    pub body: Arc<Body>,
-    pub body_source_map: Arc<BodySourceMap>,
-    pub infer: &'database InferenceResult,
+pub struct SourceAnalyzer<'db> {
+    pub db: &'db dyn HirDatabase,
+    pub body: &'db Body,
+    pub body_source_map: &'db BodySourceMap,
+    pub infer: &'db InferenceResult,
     pub owner: DefinitionWithBodyId,
 }
 
-impl<'database> SourceAnalyzer<'database> {
+impl<'db> SourceAnalyzer<'db> {
     fn new(
-        database: &'database dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         definition: DefinitionWithBodyId,
     ) -> Self {
-        let (body, body_source_map) = database.body_with_source_map(definition);
-        let infer = InferenceResult::of(database, definition);
+        let (body, body_source_map) = Body::with_source_map(db, definition);
+        let infer = InferenceResult::of(db, definition);
         Self {
-            database,
+            db,
             body,
             body_source_map,
             infer,
@@ -486,10 +475,10 @@ impl<'database> SourceAnalyzer<'database> {
     pub fn resolver_for(
         &self,
         scope: ExprOrStatement,
-    ) -> Resolver {
-        let mut resolver = self.owner.resolver(self.database);
+    ) -> Resolver<'db> {
+        let mut resolver = self.owner.resolver(self.db);
 
-        let expression_scopes = self.database.expression_scopes(self.owner);
+        let expression_scopes = ExprScopes::of(self.db, self.owner);
 
         let scope_id = scope
             .map_left(|expression| {
@@ -556,13 +545,13 @@ impl HasSource for Local {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        let file_id = self.parent.lookup(database).file_id;
+        let file_id = self.parent.lookup(db).file_id;
         let (_, source_map) =
-            database.body_with_source_map(DefinitionWithBodyId::Function(self.parent));
+            Body::with_source_map(db, DefinitionWithBodyId::Function(self.parent));
         let binding = source_map.binding_to_source(self.binding).ok()?;
-        let root = file_id.parse(database).syntax();
+        let root = file_id.parse(db).syntax();
         Some(InFile::new(file_id, binding.to_node(&root)))
     }
 }
@@ -577,13 +566,13 @@ impl HasSource for Parameter {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        let function_data = database.function_data(self.id.function).0;
+        let function_data = FunctionSignature::of(db, self.id.function);
         let parameter_data = &function_data.parameters[self.id.param];
         let parameter_name = &parameter_data.name;
 
-        let function = self.id.function.lookup(database).source(database);
+        let function = self.id.function.lookup(db).source(db);
 
         let parameter = function
             .value
@@ -608,9 +597,9 @@ impl HasSource for Function {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -624,9 +613,9 @@ impl HasSource for GlobalVariable {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -640,9 +629,9 @@ impl HasSource for GlobalConstant {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -656,9 +645,9 @@ impl HasSource for Override {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -672,9 +661,9 @@ impl HasSource for Struct {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -688,9 +677,9 @@ impl HasSource for TypeAlias {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -704,9 +693,9 @@ impl HasSource for GlobalAssertStatement {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        Some(self.id.lookup(database).source(database))
+        Some(self.id.lookup(db).source(db))
     }
 }
 
@@ -720,13 +709,13 @@ impl HasSource for Field {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        let struct_data = database.struct_data(self.id.r#struct).0;
+        let struct_data = StructSignature::of(db, self.id.r#struct);
         let field_data = &struct_data.fields()[self.id.field];
         let field_name = &field_data.name;
 
-        let r#struct = self.id.r#struct.lookup(database).source(database);
+        let r#struct = self.id.r#struct.lookup(db).source(db);
 
         let field = r#struct.value.body()?.fields().find_map(|field| {
             let name = field.name()?;
@@ -740,7 +729,6 @@ impl HasSource for Field {
 /// The defs which can be visible in the module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleDef {
-    Module(Module),
     Function(Function),
     GlobalVariable(GlobalVariable),
     GlobalConstant(GlobalConstant),
@@ -767,7 +755,7 @@ impl ModuleDef {
             Self::GlobalAssertStatement(global_assert_statement) => Some(
                 DefinitionWithBodyId::GlobalAssertStatement(global_assert_statement.id),
             ),
-            Self::Module(_) | Self::Struct(_) | Self::TypeAlias(_) => None,
+            Self::Struct(_) | Self::TypeAlias(_) => None,
         }
     }
 }
@@ -782,9 +770,9 @@ impl HasSource for Module {
 
     fn source(
         self,
-        database: &dyn DefDatabase,
+        db: &dyn SourceDatabase,
     ) -> Option<InFile<Self::Ast>> {
-        let source_file = self.file_id.parse(database).tree();
+        let source_file = self.file_id.parse(db).tree();
         Some(InFile::new(self.file_id, source_file))
     }
 }
@@ -792,30 +780,29 @@ impl HasSource for Module {
 impl Module {
     pub fn items(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Vec<ModuleDef> {
-        let item_tree = database.item_tree(self.file_id);
+        let item_tree = ItemTree::of(db, self.file_id);
         item_tree
             .top_level_items()
             .iter()
-            .flat_map(|item| module_item_to_def(database, self.file_id, *item))
+            .flat_map(|item| module_item_to_def(db, self.file_id, *item))
             .collect()
     }
 
-    pub fn diagnostics(
+    pub fn semantic_diagnostics(
         self,
-        database: &dyn HirDatabase,
-        config: &DiagnosticsConfig,
+        db: &dyn HirDatabase,
         accumulator: &mut Vec<AnyDiagnostic>,
     ) {
-        validate_identifiers(self.file_id, database, accumulator);
+        validate_identifiers(self.file_id, db, accumulator);
 
-        for item in self.items(database) {
+        for item in self.items(db) {
             match item {
-                ModuleDef::Module(_) | ModuleDef::Function(_) => {},
+                ModuleDef::Function(_) => {},
                 ModuleDef::GlobalVariable(variable) => {
-                    diagnostics::global_variable::collect(database, variable.id, |error| {
-                        if let Some(source) = variable.source(database) {
+                    diagnostics::global_variable::collect(db, variable.id, |error| {
+                        if let Some(source) = variable.source(db) {
                             let source = source.map(|declaration| AstPointer::new(&declaration));
                             accumulator.push(diagnostics::any_diag_from_global_var(error, source));
                         }
@@ -825,9 +812,9 @@ impl Module {
                 ModuleDef::Override(_constant) => {},
                 ModuleDef::GlobalAssertStatement(_global_assert_statement) => {},
                 ModuleDef::Struct(r#struct) => {
-                    let file = r#struct.id.lookup(database).file_id;
-                    let (_, signature_map) = database.struct_data(r#struct.id);
-                    let diagnostics = &database.field_types(r#struct.id).1;
+                    let file = r#struct.id.lookup(db).file_id;
+                    let (_, signature_map) = StructSignature::with_source_map(db, r#struct.id);
+                    let (_, diagnostics) = &*db.field_types(r#struct.id);
                     for diagnostic in diagnostics {
                         if diagnostic.source != ExpressionStoreSource::Signature {
                             tracing::warn!(
@@ -836,11 +823,8 @@ impl Module {
                             );
                             continue;
                         }
-                        match diagnostics::any_diag_from_infer_diagnostic(
-                            &diagnostic.kind,
-                            &signature_map,
-                            file,
-                        ) {
+                        match diagnostics::to_any_diagnostic(&diagnostic.kind, signature_map, file)
+                        {
                             Some(diagnostic) => accumulator.push(diagnostic),
                             None => {
                                 tracing::warn!("could not create diagnostic from {:?}", diagnostic);
@@ -849,9 +833,9 @@ impl Module {
                     }
                 },
                 ModuleDef::TypeAlias(type_alias) => {
-                    let file = type_alias.id.lookup(database).file_id;
-                    let (_, signature_map) = database.type_alias_data(type_alias.id);
-                    let diagnostics = &database.type_alias_type(type_alias.id).1;
+                    let file = type_alias.id.lookup(db).file_id;
+                    let (_, signature_map) = TypeAliasSignature::with_source_map(db, type_alias.id);
+                    let diagnostics = &db.type_alias_type(type_alias.id).1;
                     for diagnostic in diagnostics {
                         if diagnostic.source != ExpressionStoreSource::Signature {
                             tracing::warn!(
@@ -860,11 +844,8 @@ impl Module {
                             );
                             continue;
                         }
-                        match diagnostics::any_diag_from_infer_diagnostic(
-                            &diagnostic.kind,
-                            &signature_map,
-                            file,
-                        ) {
+                        match diagnostics::to_any_diagnostic(&diagnostic.kind, signature_map, file)
+                        {
                             Some(diagnostic) => accumulator.push(diagnostic),
                             None => {
                                 tracing::warn!("could not create diagnostic from {:?}", diagnostic);
@@ -873,17 +854,11 @@ impl Module {
                     }
                 },
             }
-            if config.type_errors {
-                check_type_errors(database, accumulator, &item);
-            }
+            check_type_errors(db, accumulator, &item);
         }
 
-        for diagnostic in &ItemScope::of(database, self.file_id).diagnostics {
-            accumulator.push(diagnostics::any_diag_from_def_diagnostic(
-                database,
-                diagnostic,
-                self.file_id,
-            ));
+        for diagnostic in &ItemScope::of(db, self.file_id).diagnostics {
+            accumulator.push(diagnostics::any_diag_from_def_diagnostic(db, diagnostic));
         }
     }
 }
@@ -894,12 +869,12 @@ impl Module {
 /// See: <https://www.w3.org/TR/WGSL/#identifiers>
 fn validate_identifiers(
     file_id: EditionedFileId,
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     accumulator: &mut Vec<AnyDiagnostic>,
 ) {
-    let item_tree = database.item_tree(file_id);
-    let ast_id_map = database.ast_id_map(file_id);
-    let root = file_id.parse(database).syntax();
+    let item_tree = ItemTree::of(db, file_id);
+    let ast_id_map = AstIdMap::of(db, file_id);
+    let root = file_id.parse(db).syntax();
 
     macro_rules! validate {
         (
@@ -951,21 +926,22 @@ fn validate_identifiers(
 }
 
 fn check_type_errors(
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     accumulator: &mut Vec<AnyDiagnostic>,
     item: &ModuleDef,
 ) {
     if let Some(definition) = item.as_def_with_body_id() {
-        let file = definition.file_id(database);
-        let (_, signature_map) = database.signature_with_source_map(definition);
-        let (_, source_map) = database.body_with_source_map(definition);
-        let infer = InferenceResult::of(database, definition);
+        let file = definition.file_id(db);
+        let (_, signature_map) =
+            ExpressionStore::with_source_map(db, ExpressionStoreOwnerId::Signature(definition));
+        let (_, source_map) = Body::with_source_map(db, definition);
+        let infer = InferenceResult::of(db, definition);
         for diagnostic in infer.diagnostics() {
-            match diagnostics::any_diag_from_infer_diagnostic(
+            match diagnostics::to_any_diagnostic(
                 &diagnostic.kind,
                 match diagnostic.source {
                     ExpressionStoreSource::Body => source_map.expression_source_map(),
-                    ExpressionStoreSource::Signature => &signature_map,
+                    ExpressionStoreSource::Signature => signature_map,
                 },
                 file,
             ) {
@@ -976,7 +952,7 @@ fn check_type_errors(
             }
         }
 
-        diagnostics::precedence::collect(database, definition, |diagnostic| {
+        diagnostics::precedence::collect(db, definition, |diagnostic| {
             match diagnostics::any_diag_from_shift(
                 &diagnostic,
                 source_map.expression_source_map(),
@@ -990,3 +966,5 @@ fn check_type_errors(
         });
     }
 }
+
+pub use hir_ty::setup_tracing;

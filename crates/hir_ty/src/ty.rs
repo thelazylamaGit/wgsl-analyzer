@@ -1,35 +1,45 @@
 pub mod pretty;
 
-use std::{
-    borrow::Cow,
-    fmt::{self, Write as _},
-    str::FromStr,
-};
+use std::{borrow::Cow, fmt, num::NonZeroU32};
 
-use base_db::impl_intern_key;
-use hir_def::{database::StructId, type_ref::VecDimensionality};
+use base_db::{Intern as _, Lookup as _, impl_intern_key, impl_intern_lookup};
+use hir_def::db::StructId;
 use wgsl_types::{
-    syntax::{AccessMode, AddressSpace},
+    syntax::{AccessMode, AddressSpace, TexelFormat},
     ty::SamplerType,
 };
 
-use crate::database::HirDatabase;
+use crate::db::HirDatabase;
 
 impl_intern_key!(Type, TypeKind);
+impl_intern_lookup!(Type, TypeKind);
 
 impl Type {
     pub fn kind(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> TypeKind {
-        database.lookup_intern_type(self)
+        self.lookup(db).clone()
     }
 
     pub fn is_err(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
-        matches!(database.lookup_intern_type(self), TypeKind::Error)
+        match self.lookup(db) {
+            TypeKind::Error => true,
+            TypeKind::Scalar(_)
+            | TypeKind::Struct(_)
+            | TypeKind::BuiltinStruct(_)
+            | TypeKind::Texture(_)
+            | TypeKind::Sampler(_) => false,
+            TypeKind::Atomic(atomic_type) => atomic_type.inner.is_err(db),
+            TypeKind::Vector(vector_type) => vector_type.component_type.is_err(db),
+            TypeKind::Matrix(matrix_type) => matrix_type.inner.is_err(db),
+            TypeKind::Array(array_type) => array_type.inner.is_err(db),
+            TypeKind::Reference(reference) => reference.inner.is_err(db),
+            TypeKind::Pointer(pointer) => pointer.inner.is_err(db),
+        }
     }
 
     #[expect(clippy::doc_paragraphs_missing_punctuation, reason = "false positive")]
@@ -37,76 +47,123 @@ impl Type {
     #[must_use]
     pub fn this_or_vec_inner(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Self {
-        match self.kind(database) {
+        match self.kind(db) {
             TypeKind::Vector(vector) => vector.component_type,
-            TypeKind::Reference(reference) => reference.inner.this_or_vec_inner(database),
+            TypeKind::Reference(reference) => reference.inner.this_or_vec_inner(db),
             TypeKind::Error
             | TypeKind::Scalar(_)
             | TypeKind::Atomic(_)
             | TypeKind::Matrix(_)
             | TypeKind::Struct(_)
+            | TypeKind::BuiltinStruct(_)
             | TypeKind::Array(_)
             | TypeKind::Texture(_)
             | TypeKind::Sampler(_)
-            | TypeKind::Pointer(_)
-            | TypeKind::BoundVariable(_)
-            | TypeKind::StorageTypeOfTexelFormat(_) => self,
+            | TypeKind::Pointer(_) => self,
         }
     }
 
     pub fn is_convertible_to(
         self,
         r#type: Self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
-        self.kind(database)
-            .is_convertible_to(&r#type.kind(database), database)
+        self.kind(db).is_convertible_to(&r#type.kind(db), db)
     }
 
     #[expect(clippy::doc_paragraphs_missing_punctuation, reason = "false positive")]
-    /// `ref<inner>` -> `inner`, `ptr<inner>` -> `ptr<inner>`
-    #[must_use]
-    pub fn unref(
-        self,
-        database: &dyn HirDatabase,
-    ) -> Self {
-        match self.kind(database) {
-            TypeKind::Reference(reference) => reference.inner,
-            TypeKind::Error
-            | TypeKind::Scalar(_)
-            | TypeKind::Atomic(_)
-            | TypeKind::Vector(_)
-            | TypeKind::Matrix(_)
-            | TypeKind::Struct(_)
-            | TypeKind::Array(_)
-            | TypeKind::Texture(_)
-            | TypeKind::Sampler(_)
-            | TypeKind::Pointer(_)
-            | TypeKind::BoundVariable(_)
-            | TypeKind::StorageTypeOfTexelFormat(_) => self,
-        }
-    }
-
+    /// The type T is the concretization of type S if:
+    /// - T is concrete, and
+    /// - T is not a reference type, and
+    /// - ConversionRank(S, T) is finite, and
+    /// - For any other non-reference type T2, ConversionRank(S, T2) > ConversionRank(S, T).
+    ///
+    /// The concretization of a value e of type T is the value resulting from applying, to e, the
+    /// feasible conversion that maps T to the concretization of T.
+    ///
+    /// Reference: <https://www.w3.org/TR/WGSL/#concretization>
     #[must_use]
     pub fn concretize(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Self {
-        match self.kind(database).concretize(database) {
-            Some(type_kind) => type_kind.intern(database),
+        match self.kind(db).concretize(db) {
+            Some(type_kind) => type_kind.intern(db),
             None => self,
+        }
+    }
+
+    #[expect(clippy::doc_paragraphs_missing_punctuation, reason = "false positive")]
+    /// Apply the load rule.
+    ///
+    /// Reference: <https://www.w3.org/TR/WGSL/#load-rule>
+    #[must_use]
+    pub fn loaded(
+        self,
+        db: &dyn HirDatabase,
+    ) -> Self {
+        if let TypeKind::Reference(Reference {
+            address_space: _,
+            inner,
+            access_mode: _,
+        }) = self.kind(db)
+        {
+            debug_assert!(!matches!(inner.kind(db), TypeKind::Reference(_)));
+            inner
+        } else {
+            self
         }
     }
 
     pub fn contains_struct(
         self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
         r#struct: StructId,
     ) -> bool {
-        self.kind(database).contains_struct(database, r#struct)
+        self.kind(db).contains_struct(db, r#struct)
     }
+}
+
+#[salsa::tracked]
+impl Type {
+    /// Apply the load rule.
+    ///
+    /// Reference: <https://www.w3.org/TR/WGSL/#load-rule>
+    #[salsa::tracked(cycle_result = |_, _, _| false)]
+    pub fn is_constructible(
+        self,
+        db: &dyn HirDatabase,
+    ) -> bool {
+        match self.kind(db) {
+            TypeKind::Error | TypeKind::Scalar(_) | TypeKind::Vector(_) | TypeKind::Matrix(_) => {
+                true
+            },
+            TypeKind::Struct(struct_id) => db
+                .field_types(struct_id)
+                .0
+                .iter()
+                .all(|(_, field_type)| *field_type.is_constructible(db)),
+            TypeKind::BuiltinStruct(builtin_struct) => builtin_struct
+                .fields
+                .iter()
+                .all(|(_, field_type)| *field_type.is_constructible(db)),
+            TypeKind::Array(array_type) => array_type.is_constructible(db),
+            TypeKind::Atomic(_)
+            | TypeKind::Texture(_)
+            | TypeKind::Sampler(_)
+            | TypeKind::Reference(_)
+            | TypeKind::Pointer(_) => false,
+        }
+    }
+}
+
+/// A struct type returned by builtin functions.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BuiltinStruct {
+    pub name: String,
+    pub fields: Vec<(String, Type)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,53 +176,47 @@ pub enum TypeKind {
     Vector(VectorType),
     Matrix(MatrixType),
     Struct(StructId),
+    BuiltinStruct(BuiltinStruct),
     Array(ArrayType),
     Texture(TextureType),
     Sampler(SamplerType),
     Reference(Reference),
     Pointer(Pointer),
-    BoundVariable(BoundVariable),
-    StorageTypeOfTexelFormat(BoundVariable), // for example, rgba8unorm -> vec4<f32>
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct BoundVariable {
-    pub index: usize,
 }
 
 impl TypeKind {
     pub fn is_convertible_to(
         &self,
         r#type: &Self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
-        conversion_rank(self, r#type, database).is_some()
+        conversion_rank(self, r#type, db).is_some()
     }
 
     pub fn unref(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Cow<'_, Self> {
         match self {
-            Self::Reference(reference) => Cow::Owned(reference.inner.kind(database)),
+            Self::Reference(reference) => Cow::Owned(reference.inner.kind(db)),
             Self::Error
             | Self::Scalar(_)
             | Self::Atomic(_)
             | Self::Vector(_)
             | Self::Matrix(_)
             | Self::Struct(_)
+            | Self::BuiltinStruct(_)
             | Self::Array(_)
             | Self::Texture(_)
             | Self::Sampler(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => Cow::Borrowed(self),
+            | Self::Pointer(_) => Cow::Borrowed(self),
         }
     }
 
+    /// Abstract types will be mapped to the corresponding default concrete type.
     pub fn concretize(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Option<Self> {
         Some(match self {
             Self::Scalar(ScalarType::AbstractInt) => Self::Scalar(ScalarType::I32),
@@ -175,7 +226,7 @@ impl TypeKind {
                 binding_array,
                 size,
             }) => Self::Array(ArrayType {
-                inner: inner.kind(database).concretize(database)?.intern(database),
+                inner: inner.kind(db).concretize(db)?.intern(db),
                 binding_array: *binding_array,
                 size: size.clone(),
             }),
@@ -184,10 +235,7 @@ impl TypeKind {
                 component_type,
             }) => Self::Vector(VectorType {
                 size: *size,
-                component_type: component_type
-                    .kind(database)
-                    .concretize(database)?
-                    .intern(database),
+                component_type: component_type.kind(db).concretize(db)?.intern(db),
             }),
             Self::Matrix(MatrixType {
                 columns,
@@ -196,18 +244,17 @@ impl TypeKind {
             }) => Self::Matrix(MatrixType {
                 columns: *columns,
                 rows: *rows,
-                inner: inner.kind(database).concretize(database)?.intern(database),
+                inner: inner.kind(db).concretize(db)?.intern(db),
             }),
             Self::Error
             | Self::Scalar(_)
             | Self::Atomic(_)
             | Self::Struct(_)
+            | Self::BuiltinStruct(_)
             | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => return None,
+            | Self::Pointer(_) => return None,
         })
     }
 
@@ -220,13 +267,12 @@ impl TypeKind {
             | Self::Vector(_)
             | Self::Matrix(_)
             | Self::Struct(_)
+            | Self::BuiltinStruct(_)
             | Self::Array(_)
             | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Pointer(_) => false,
         }
     }
 
@@ -236,6 +282,7 @@ impl TypeKind {
             Self::Scalar(scalar) => scalar.is_index(),
             Self::Error
             | Self::Atomic(_)
+            | Self::BuiltinStruct(_)
             | Self::Vector(_)
             | Self::Matrix(_)
             | Self::Struct(_)
@@ -243,16 +290,14 @@ impl TypeKind {
             | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Pointer(_) => false,
         }
     }
 
     #[must_use]
     pub fn is_abstract(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
         match self {
             Self::Scalar(ScalarType::AbstractInt | ScalarType::AbstractFloat) => true,
@@ -261,25 +306,17 @@ impl TypeKind {
                 component_type: inner,
                 ..
             })
-            | Self::Matrix(MatrixType { inner, .. }) => inner.kind(database).is_abstract(database),
+            | Self::Matrix(MatrixType { inner, .. }) => inner.kind(db).is_abstract(db),
             Self::Scalar(_)
             | Self::Error
             | Self::Atomic(_)
             | Self::Struct(_)
+            | Self::BuiltinStruct(_)
             | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Pointer(_) => false,
         }
-    }
-
-    pub fn intern(
-        self,
-        database: &dyn HirDatabase,
-    ) -> Type {
-        database.intern_type(self)
     }
 
     #[must_use]
@@ -297,6 +334,7 @@ impl TypeKind {
                 | Self::Atomic(_)
                 | Self::Array(_)
                 | Self::Struct(_)
+                | Self::BuiltinStruct(_)
         )
     }
 
@@ -332,86 +370,82 @@ impl TypeKind {
 
     pub fn is_host_shareable(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
         match self {
             Self::Scalar(scalar) => scalar.is_numeric(),
-            Self::Vector(vec) => vec.component_type.kind(database).is_numeric_scalar(),
+            Self::Vector(vec) => vec.component_type.kind(db).is_numeric_scalar(),
             // Error types are treated as optimistically compatible to avoid
             // irrelevant diagnostics (for example, when a struct is not yet defined).
             Self::Matrix(_) | Self::Atomic(_) | Self::Error => true,
-            Self::Array(array) => array.inner.kind(database).is_host_shareable(database),
-            Self::Struct(r#struct) => database
+            Self::Array(array) => array.inner.kind(db).is_host_shareable(db),
+            Self::Struct(r#struct) => db
                 .field_types(*r#struct)
                 .0
                 .iter()
-                .all(|(_, r#type)| r#type.kind(database).is_host_shareable(database)),
-            Self::Texture(_)
+                .all(|(_, r#type)| r#type.kind(db).is_host_shareable(db)),
+            Self::BuiltinStruct(_)
+            | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Pointer(_) => false,
         }
     }
 
     pub fn contains_runtime_sized_array(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> bool {
         match self {
             Self::Array(ArrayType {
                 size: ArraySize::Dynamic,
                 ..
             }) => true,
-            Self::Struct(r#struct) => database
+            Self::Struct(r#struct) => db
                 .field_types(*r#struct)
                 .0
                 .iter()
-                .any(|(_, r#type)| r#type.kind(database).contains_runtime_sized_array(database)),
+                .any(|(_, r#type)| r#type.kind(db).contains_runtime_sized_array(db)),
             Self::Error
             | Self::Scalar(_)
             | Self::Atomic(_)
             | Self::Vector(_)
             | Self::Matrix(_)
             | Self::Array(_)
+            | Self::BuiltinStruct(_)
             | Self::Texture(_)
             | Self::Sampler(_)
             | Self::Reference(_)
-            | Self::Pointer(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Pointer(_) => false,
         }
     }
 
     pub fn contains_struct(
         &self,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
         r#struct: StructId,
     ) -> bool {
         match self {
-            Self::Atomic(atomic) => atomic.inner.contains_struct(database, r#struct),
+            Self::Atomic(atomic) => atomic.inner.contains_struct(db, r#struct),
             Self::Struct(id) => {
                 if *id == r#struct {
                     return true;
                 }
-                database
-                    .field_types(*id)
+                db.field_types(*id)
                     .0
                     .values()
-                    .any(|r#type| r#type.contains_struct(database, r#struct))
+                    .any(|r#type| r#type.contains_struct(db, r#struct))
             },
-            Self::Array(array) => array.inner.contains_struct(database, r#struct),
-            Self::Reference(reference) => reference.inner.contains_struct(database, r#struct),
-            Self::Pointer(pointer) => pointer.inner.contains_struct(database, r#struct),
+            Self::Array(array) => array.inner.contains_struct(db, r#struct),
+            Self::Reference(reference) => reference.inner.contains_struct(db, r#struct),
+            Self::Pointer(pointer) => pointer.inner.contains_struct(db, r#struct),
             Self::Error
             | Self::Scalar(_)
             | Self::Vector(_)
             | Self::Matrix(_)
+            | Self::BuiltinStruct(_)
             | Self::Texture(_)
-            | Self::Sampler(_)
-            | Self::BoundVariable(_)
-            | Self::StorageTypeOfTexelFormat(_) => false,
+            | Self::Sampler(_) => false,
         }
     }
 }
@@ -421,7 +455,7 @@ impl TypeKind {
 fn conversion_rank(
     ty1: &TypeKind,
     ty2: &TypeKind,
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
 ) -> Option<u32> {
     // reference: <https://www.w3.org/TR/WGSL/#conversion-rank>
     match (ty1, ty2) {
@@ -433,7 +467,7 @@ fn conversion_rank(
                 ..
             }),
             ty2,
-        ) if &ty1.kind(database) == ty2 => Some(0),
+        ) if &ty1.kind(db) == ty2 => Some(0),
         (
             TypeKind::Scalar(ScalarType::AbstractInt),
             TypeKind::Scalar(ScalarType::AbstractFloat),
@@ -461,7 +495,7 @@ fn conversion_rank(
                 size: n2,
                 ..
             }),
-        ) if n1 == n2 => conversion_rank(&ty1.kind(database), &ty2.kind(database), database),
+        ) if n1 == n2 => conversion_rank(&ty1.kind(db), &ty2.kind(db), db),
         (
             TypeKind::Vector(VectorType {
                 size: n1,
@@ -471,7 +505,7 @@ fn conversion_rank(
                 size: n2,
                 component_type: ty2,
             }),
-        ) if n1 == n2 => conversion_rank(&ty1.kind(database), &ty2.kind(database), database),
+        ) if n1 == n2 => conversion_rank(&ty1.kind(db), &ty2.kind(db), db),
         (
             TypeKind::Matrix(MatrixType {
                 columns: c1,
@@ -483,9 +517,10 @@ fn conversion_rank(
                 rows: r2,
                 inner: ty2,
             }),
-        ) if c1 == c2 && r1 == r2 => {
-            conversion_rank(&ty1.kind(database), &ty2.kind(database), database)
-        },
+        ) if c1 == c2 && r1 == r2 => conversion_rank(&ty1.kind(db), &ty2.kind(db), db),
+        // optimistically assume that whatever went wrong, the intention was for it to work
+        // prevents extra diagnostics from being emitted
+        (TypeKind::Error, _) | (_, TypeKind::Error) => Some(0),
         _ => None,
     }
 }
@@ -524,6 +559,21 @@ pub enum ScalarType {
 }
 
 impl ScalarType {
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Bool => "bool",
+            Self::AbstractInt => "__abstract_int",
+            Self::AbstractFloat => "__abstract_float",
+            Self::I32 => "i32",
+            Self::U32 => "u32",
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::I64 => "i64",
+            Self::U64 => "u64",
+        }
+    }
+
     #[must_use]
     #[expect(clippy::doc_paragraphs_missing_punctuation, reason = "false positive")]
     /// The numeric scalar types are [`AbstractInt`], [`AbstractFloat`], [`i32`], [`u32`], [`f32`], and [`f16`].
@@ -579,9 +629,6 @@ pub enum VecSize {
     Two,
     Three,
     Four,
-    // TODO: Maybe clean this up during builtin refactor
-    // See: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/559
-    BoundVariable(BoundVariable),
 }
 
 impl TryFrom<u8> for VecSize {
@@ -597,16 +644,6 @@ impl TryFrom<u8> for VecSize {
     }
 }
 
-impl From<VecDimensionality> for VecSize {
-    fn from(dimensionality: VecDimensionality) -> Self {
-        match dimensionality {
-            VecDimensionality::Two => Self::Two,
-            VecDimensionality::Three => Self::Three,
-            VecDimensionality::Four => Self::Four,
-        }
-    }
-}
-
 impl fmt::Display for VecSize {
     fn fmt(
         &self,
@@ -616,10 +653,6 @@ impl fmt::Display for VecSize {
             Self::Two => formatter.write_str("2"),
             Self::Three => formatter.write_str("3"),
             Self::Four => formatter.write_str("4"),
-            Self::BoundVariable(variable) => {
-                let mut names = "NMOPQRS".chars();
-                write!(formatter, "{}", names.nth(variable.index).unwrap())
-            },
         }
     }
 }
@@ -631,12 +664,11 @@ impl VecSize {
     ///
     /// Panics if self is the [`BoundVariable`] variant.
     #[must_use]
-    pub fn as_u8(self) -> u8 {
+    pub const fn as_u8(self) -> u8 {
         match self {
             Self::Two => 2,
             Self::Three => 3,
             Self::Four => 4,
-            Self::BoundVariable(_) => panic!("VecSize::BoundVariable cannot be made into an u8"),
         }
     }
 }
@@ -654,9 +686,14 @@ pub struct VectorType {
 }
 
 impl VectorType {
-    // fn is_numeric(&self) -> bool {
-    //     self.component_type.is_numeric()
-    // }
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self.size {
+            VecSize::Two => "vec2",
+            VecSize::Three => "vec3",
+            VecSize::Four => "vec4",
+        }
+    }
 }
 
 #[expect(clippy::doc_paragraphs_missing_punctuation, reason = "false positive")]
@@ -675,6 +712,23 @@ pub struct MatrixType {
     pub inner: Type,
 }
 
+impl MatrixType {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match (self.columns, self.rows) {
+            (VecSize::Two, VecSize::Two) => "mat2x2",
+            (VecSize::Two, VecSize::Three) => "mat2x3",
+            (VecSize::Two, VecSize::Four) => "mat2x4",
+            (VecSize::Three, VecSize::Two) => "mat3x2",
+            (VecSize::Three, VecSize::Three) => "mat3x3",
+            (VecSize::Three, VecSize::Four) => "mat3x4",
+            (VecSize::Four, VecSize::Two) => "mat4x2",
+            (VecSize::Four, VecSize::Three) => "mat4x3",
+            (VecSize::Four, VecSize::Four) => "mat4x4",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AtomicType {
     pub inner: Type,
@@ -687,14 +741,29 @@ pub struct ArrayType {
     pub size: ArraySize,
 }
 
+impl ArrayType {
+    #[expect(clippy::unused_self, reason = "intended API")]
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        "array"
+    }
+
+    pub fn is_constructible(
+        &self,
+        db: &dyn HirDatabase,
+    ) -> bool {
+        self.size != ArraySize::Dynamic && *self.inner.is_constructible(db)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArraySize {
-    Constant(u32),
+    Constant(NonZeroU32),
     Dynamic,
 }
 
 impl ArraySize {
-    pub const MAX: u32 = u32::MAX;
+    pub const MAX: NonZeroU32 = NonZeroU32::MAX;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -730,17 +799,17 @@ pub enum TextureKind {
 impl TextureKind {
     pub fn from_sampled(
         sampled: wgsl_types::syntax::SampledType,
-        database: &dyn HirDatabase,
+        db: &dyn HirDatabase,
     ) -> Self {
         match sampled {
             wgsl_types::syntax::SampledType::I32 => {
-                Self::Sampled(TypeKind::Scalar(ScalarType::I32).intern(database))
+                Self::Sampled(TypeKind::Scalar(ScalarType::I32).intern(db))
             },
             wgsl_types::syntax::SampledType::U32 => {
-                Self::Sampled(TypeKind::Scalar(ScalarType::U32).intern(database))
+                Self::Sampled(TypeKind::Scalar(ScalarType::U32).intern(db))
             },
             wgsl_types::syntax::SampledType::F32 => {
-                Self::Sampled(TypeKind::Scalar(ScalarType::F32).intern(database))
+                Self::Sampled(TypeKind::Scalar(ScalarType::F32).intern(db))
             },
         }
     }
@@ -765,101 +834,5 @@ impl fmt::Display for TextureDimensionality {
             Self::D3 => formatter.write_str("3d"),
             Self::Cube => formatter.write_str("cube"),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum TexelFormat {
-    Rgba8unorm,
-    Rgba8snorm,
-    Rgba8uint,
-    Rgba8sint,
-    Rgba16uint,
-    Rgba16sint,
-    Rgba16float,
-    Rgba32uint,
-    Rgba32sint,
-    Rgba32float,
-
-    R32uint,
-    R32sint,
-    R32float,
-    Rg32uint,
-    Rg32sint,
-    Rg32float,
-
-    Bgra8unorm,
-
-    #[deprecated(
-        note = "Intended to be refactored and removed in https://github.com/wgsl-analyzer/wgsl-analyzer/issues/559"
-    )]
-    /// This is only used for builtins which care a little bit about the format.
-    BoundVariable(BoundVariable),
-    /// This is only used for builtins which do not care about the format.
-    #[deprecated(
-        note = "Intended to be refactored and removed in https://github.com/wgsl-analyzer/wgsl-analyzer/issues/559"
-    )]
-    Any,
-}
-
-impl fmt::Display for TexelFormat {
-    fn fmt(
-        &self,
-        formatter: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        #[expect(
-            deprecated,
-            reason = "TODO: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/559"
-        )]
-        let str = match self {
-            Self::Rgba8unorm => "rgba8unorm",
-            Self::Rgba8snorm => "rgba8snorm",
-            Self::Rgba8uint => "rgba8uint",
-            Self::Rgba8sint => "rgba8sint",
-            Self::Rgba16uint => "rgba16uint",
-            Self::Rgba16sint => "rgba16sint",
-            Self::Rgba16float => "rgba16float",
-            Self::Rgba32uint => "rgba32uint",
-            Self::Rgba32sint => "rgba32sint",
-            Self::Rgba32float => "rgba32float",
-            Self::R32uint => "r32uint",
-            Self::R32sint => "r32sint",
-            Self::R32float => "r32float",
-            Self::Rg32uint => "rg32uint",
-            Self::Rg32sint => "rg32sint",
-            Self::Rg32float => "rg32float",
-            Self::Bgra8unorm => "bgra8unorm",
-            Self::BoundVariable(variable) => {
-                return formatter.write_char(('F'..).nth(variable.index).unwrap());
-            },
-            Self::Any => "_",
-        };
-        formatter.write_str(str)
-    }
-}
-
-impl FromStr for TexelFormat {
-    type Err = ();
-
-    fn from_str(string: &str) -> Result<Self, Self::Err> {
-        Ok(match string {
-            "rgba8unorm" => Self::Rgba8unorm,
-            "rgba8snorm" => Self::Rgba8snorm,
-            "rgba8uint" => Self::Rgba8uint,
-            "rgba8sint" => Self::Rgba8sint,
-            "rgba16uint" => Self::Rgba16uint,
-            "rgba16sint" => Self::Rgba16sint,
-            "rgba16float" => Self::Rgba16float,
-            "rgba32uint" => Self::Rgba32uint,
-            "rgba32sint" => Self::Rgba32sint,
-            "rgba32float" => Self::Rgba32float,
-            "r32uint" => Self::R32uint,
-            "r32sint" => Self::R32sint,
-            "r32float" => Self::R32float,
-            "rg32uint" => Self::Rg32uint,
-            "rg32sint" => Self::Rg32sint,
-            "rg32float" => Self::Rg32float,
-            _ => return Err(()),
-        })
     }
 }

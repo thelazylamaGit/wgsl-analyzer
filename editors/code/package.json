@@ -16,6 +16,7 @@
 	"license": "MIT OR Apache-2.0",
 	"keywords": [
 		"shading",
+		"shader",
 		"web",
 		"wesl",
 		"wgsl"
@@ -32,14 +33,14 @@
 		}
 	},
 	"engines": {
-		"vscode": "^1.120.0",
+		"vscode": "^1.125.0",
 		"node": "^24.15.0"
 	},
 	"devEngines": {
-		"pnpm": "^11.5.2"
+		"pnpm": "^11.15.1"
 	},
 	"engineStrict": true,
-	"packageManager": "pnpm@11.5.2+sha512.71c631e382066efc25625d5cf029075de07b61b37f6e27350fbd84b1bda5864c8c1967adc280776b45c30a715c0359a3be08fef42d5bb09e2b99029979692916",
+	"packageManager": "pnpm@11.21.0+sha512.521705bce689924eac72f5a3587122f362689ef6571e55ba80076fd637c11132ecffada26fad4ea79c485bfddbfd3d5a2a5b05805a77e893de71ec8a6cca3bb1",
 	"enabledApiProposals": [],
 	"extensionKind": [
 		"workspace"
@@ -60,28 +61,28 @@
 		"watch": "pnpm run build-base --sourcemap --watch"
 	},
 	"dependencies": {
-		"@hpcc-js/wasm": "^2.34.0",
+		"@hpcc-js/wasm": "^2.35.0",
 		"anser": "^2.3.5",
 		"d3": "^7.9.0",
 		"d3-graphviz": "^5.6.0",
 		"fp-ts": "^2.16.11",
 		"io-ts": "^2.2.22",
 		"jiti": "^2.7.0",
-		"vscode-languageclient": "^9.0.1"
+		"vscode-languageclient": "^10.1.0"
 	},
 	"devDependencies": {
-		"@biomejs/biome": "^2.5.0",
+		"@biomejs/biome": "^2.5.8",
 		"@tsconfig/node-ts": "^23.6.4",
-		"@tsconfig/node22": "^22.0.5",
+		"@tsconfig/node24": "^24.0.0",
 		"@tsconfig/strictest": "^2.0.8",
-		"@types/node": "^25.9.3",
-		"@types/vscode": "^1.120.0",
-		"@vscode/test-electron": "^3.0.0",
+		"@types/node": "^25.9.5",
+		"@types/vscode": "^1.125.0",
+		"@vscode/test-electron": "^3.1.0",
 		"@vscode/vsce": "^3.9.2",
-		"esbuild": "^0.28.1",
-		"ovsx": "^1.0.1",
+		"esbuild": "^0.28.2",
+		"ovsx": "^1.1.1",
 		"tslib": "^2.8.1",
-		"typescript": "^6.0.3"
+		"typescript": "^7.0.2"
 	},
 	"main": "./out/main.js",
 	"activationEvents": [
@@ -448,8 +449,8 @@
 			{
 				"title": "Diagnostics",
 				"properties": {
-					"wgsl-analyzer.diagnostics.nagaParsingErrors": {
-						"markdownDescription": "Controls whether to show naga's parsing errors.",
+					"wgsl-analyzer.diagnostics.external.naga.parsing": {
+						"markdownDescription": "Whether to show diagnostics from naga about parsing.",
 						"default": true,
 						"type": "boolean"
 					}
@@ -458,8 +459,8 @@
 			{
 				"title": "Diagnostics",
 				"properties": {
-					"wgsl-analyzer.diagnostics.nagaValidationErrors": {
-						"markdownDescription": "Controls whether to show naga's validation errors.",
+					"wgsl-analyzer.diagnostics.external.naga.validation.errors": {
+						"markdownDescription": "Whether to show diagnostics from naga about validation.",
 						"default": true,
 						"type": "boolean"
 					}
@@ -468,7 +469,7 @@
 			{
 				"title": "Diagnostics",
 				"properties": {
-					"wgsl-analyzer.diagnostics.nagaVersion": {
+					"wgsl-analyzer.diagnostics.external.naga.version": {
 						"markdownDescription": "Naga version used for validation.",
 						"default": "0.29",
 						"type": "string",
@@ -490,8 +491,31 @@
 			{
 				"title": "Diagnostics",
 				"properties": {
-					"wgsl-analyzer.diagnostics.typeErrors": {
-						"markdownDescription": "Controls whether to show type errors.",
+					"wgsl-analyzer.diagnostics.external.tintErrors": {
+						"markdownDescription": "Whether to show Tint shader compiler's messages.",
+						"default": false,
+						"type": "boolean"
+					}
+				}
+			},
+			{
+				"title": "Diagnostics",
+				"properties": {
+					"wgsl-analyzer.diagnostics.external.tintPath": {
+						"markdownDescription": "The path to the tint binary.",
+						"default": null,
+						"type": [
+							"null",
+							"string"
+						]
+					}
+				}
+			},
+			{
+				"title": "Diagnostics",
+				"properties": {
+					"wgsl-analyzer.diagnostics.semanticErrors": {
+						"markdownDescription": "Whether to show diagnostics about the code semantics.",
 						"default": true,
 						"type": "boolean"
 					}
@@ -710,7 +734,8 @@
 				"scopeName": "markdown.wgsl.codeblock",
 				"path": "./syntaxes/inline-wgsl.markdown.tmLanguage.json",
 				"injectTo": [
-					"text.html.markdown"
+					"text.html.markdown",
+					"source.mdx"
 				],
 				"embeddedLanguages": {
 					"meta.embedded.block.wgsl": "wgsl"
@@ -749,7 +774,8 @@
 				"scopeName": "markdown.wesl.codeblock",
 				"path": "./syntaxes/inline-wesl.markdown.tmLanguage.json",
 				"injectTo": [
-					"text.html.markdown"
+					"text.html.markdown",
+					"source.mdx"
 				],
 				"embeddedLanguages": {
 					"meta.embedded.block.wesl": "wesl"

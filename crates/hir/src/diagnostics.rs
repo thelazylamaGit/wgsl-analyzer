@@ -10,8 +10,7 @@ use hir_def::{
     name_resolution::{DefDiagnostic, DefDiagnosticKind},
 };
 use hir_ty::{
-    builtins::BuiltinId,
-    database::HirDatabase,
+    db::HirDatabase,
     diagnostics::InferenceDiagnosticKind,
     infer::TypeExpectation,
     lower::{LoweredKind, TypeContainer, TypeLoweringError, TypeLoweringErrorKind},
@@ -22,37 +21,6 @@ use syntax::{ast, pointer::AstPointer};
 
 use self::{global_variable::GlobalVariableDiagnostic, precedence::PrecedenceDiagnostic};
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum NagaVersion {
-    Naga27,
-    Naga28,
-    #[default]
-    Naga29,
-    NagaMain,
-}
-
-#[derive(Clone, Debug)]
-pub struct DiagnosticsConfig {
-    /// Whether native diagnostics are enabled.
-    pub enabled: bool,
-    pub type_errors: bool,
-    pub naga_parsing_errors: bool,
-    pub naga_validation_errors: bool,
-    pub naga_version: NagaVersion,
-}
-
-impl Default for DiagnosticsConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            type_errors: true,
-            naga_parsing_errors: true,
-            naga_validation_errors: true,
-            naga_version: NagaVersion::default(),
-        }
-    }
-}
-
 pub enum AnyDiagnostic {
     ParseError {
         message: String,
@@ -61,9 +29,15 @@ pub enum AnyDiagnostic {
     },
 
     // Module system errors
-    UnresolvedImport {
+    UnnamedImport {
+        id: InFile<AstPointer<ast::ImportStatement>>,
+    },
+    UnresolvedPackage {
         id: InFile<AstPointer<ast::ImportStatement>>,
         name: Name,
+    },
+    UnresolvedImport {
+        id: InFile<AstPointer<ast::ImportStatement>>,
     },
     TooManySupers {
         id: InFile<AstPointer<ast::ImportStatement>>,
@@ -95,11 +69,7 @@ pub enum AnyDiagnostic {
         expression: InFile<AstPointer<ast::Expression>>,
         r#type: Type,
     },
-    UnresolvedName {
-        expression: InFile<AstPointer<ast::Expression>>,
-        name: Name,
-    },
-    InvalidConstructionType {
+    NotConstructible {
         expression: InFile<AstPointer<ast::Expression>>,
         r#type: Type,
     },
@@ -108,17 +78,7 @@ pub enum AnyDiagnostic {
         n_expected: usize,
         n_actual: usize,
     },
-    NoBuiltinOverload {
-        expression: InFile<AstPointer<ast::Expression>>,
-        builtin: BuiltinId,
-        name: Option<&'static str>,
-        parameters: Vec<Type>,
-    },
-    AddressOfNotReference {
-        expression: InFile<AstPointer<ast::Expression>>,
-        actual: Type,
-    },
-    DerefNotPointer {
+    StoreTypeMustBeStorable {
         expression: InFile<AstPointer<ast::Expression>>,
         actual: Type,
     },
@@ -148,11 +108,21 @@ pub enum AnyDiagnostic {
         message: String,
         related: Vec<(String, FileRange)>,
     },
+    TintValidationError {
+        file_id: EditionedFileId,
+        range: TextRange,
+        message: String,
+        severity: Severity,
+    },
     NoConstructor {
         expression: InFile<AstPointer<ast::Expression>>,
-        builtins: BuiltinId,
         r#type: Type,
         parameters: Vec<Type>,
+    },
+    NoOverload {
+        expression: InFile<AstPointer<ast::Expression>>,
+        parameters: Vec<Type>,
+        name: Name,
     },
     CyclicType {
         file_id: EditionedFileId,
@@ -177,6 +147,18 @@ pub enum AnyDiagnostic {
         actual: LoweredKind,
         path: Path,
     },
+    UnexpectedReturnValue {
+        expression: InFile<AstPointer<ast::Expression>>,
+        actual: Type,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub enum Severity {
+    Error,
+    Warning,
+    Information,
+    Hint,
 }
 
 impl AnyDiagnostic {
@@ -187,27 +169,29 @@ impl AnyDiagnostic {
             Self::TypeMismatch { expression, .. }
             | Self::NoSuchField { expression, .. }
             | Self::ArrayAccessInvalidType { expression, .. }
-            | Self::UnresolvedName { expression, .. }
-            | Self::InvalidConstructionType { expression, .. }
+            | Self::NotConstructible { expression, .. }
             | Self::FunctionCallArgCountMismatch { expression, .. }
-            | Self::NoBuiltinOverload { expression, .. }
-            | Self::AddressOfNotReference { expression, .. }
-            | Self::DerefNotPointer { expression, .. }
+            | Self::StoreTypeMustBeStorable { expression, .. }
             | Self::NoConstructor { expression, .. }
+            | Self::NoOverload { expression, .. }
             | Self::PrecedenceParensRequired { expression, .. }
             | Self::UnexpectedTemplateArgument { expression, .. }
             | Self::WgslError { expression, .. }
             | Self::InvalidIdentExpression { expression, .. }
+            | Self::UnexpectedReturnValue { expression, .. }
             | Self::ExpectedLoweredKind { expression, .. } => expression.file_id,
             Self::MissingAddressSpace { variable } | Self::InvalidAddressSpace { variable, .. } => {
                 variable.file_id
             },
             Self::InvalidTypeSpecifier { type_specifier, .. } => type_specifier.file_id,
             Self::NagaValidationError { file_id, .. }
+            | Self::TintValidationError { file_id, .. }
             | Self::ParseError { file_id, .. }
             | Self::CyclicType { file_id, .. }
             | Self::InvalidIdentifier { file_id, .. } => *file_id,
-            Self::UnresolvedImport { id, .. }
+            Self::UnnamedImport { id, .. }
+            | Self::UnresolvedPackage { id, .. }
+            | Self::UnresolvedImport { id, .. }
             | Self::TooManySupers { id }
             | Self::DetachedFile { id } => id.file_id,
             Self::NameConflict { item, .. } => item.file_id,
@@ -216,7 +200,7 @@ impl AnyDiagnostic {
 }
 
 #[expect(clippy::too_many_lines, reason = "long but simple match")]
-pub(crate) fn any_diag_from_infer_diagnostic(
+pub(crate) fn to_any_diagnostic(
     infer_diagnostic: &InferenceDiagnosticKind,
     source_map: &ExpressionSourceMap,
     file_id: EditionedFileId,
@@ -239,7 +223,7 @@ pub(crate) fn any_diag_from_infer_diagnostic(
             let source = InFile::new(file_id, pointer);
             AnyDiagnostic::TypeMismatch {
                 expression: source,
-                expected: expected.clone(),
+                expected: *expected,
                 actual: *actual,
             }
         },
@@ -250,7 +234,6 @@ pub(crate) fn any_diag_from_infer_diagnostic(
         } => {
             let pointer = source_map.expression_to_source(*expression).ok()?.clone();
             let source = InFile::new(file_id, pointer);
-
             AnyDiagnostic::NoSuchField {
                 expression: source,
                 name: name.clone(),
@@ -260,26 +243,15 @@ pub(crate) fn any_diag_from_infer_diagnostic(
         InferenceDiagnosticKind::ArrayAccessInvalidType { expression, r#type } => {
             let pointer = source_map.expression_to_source(*expression).ok()?.clone();
             let source = InFile::new(file_id, pointer);
-
             AnyDiagnostic::ArrayAccessInvalidType {
                 expression: source,
                 r#type: *r#type,
             }
         },
-        InferenceDiagnosticKind::UnresolvedName { expression, name } => {
+        InferenceDiagnosticKind::NotConstructible { expression, r#type } => {
             let pointer = source_map.expression_to_source(*expression).ok()?.clone();
             let source = InFile::new(file_id, pointer);
-
-            AnyDiagnostic::UnresolvedName {
-                expression: source,
-                name: name.clone(),
-            }
-        },
-        InferenceDiagnosticKind::InvalidConstructionType { expression, r#type } => {
-            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
-            let source = InFile::new(file_id, pointer);
-
-            AnyDiagnostic::InvalidConstructionType {
+            AnyDiagnostic::NotConstructible {
                 expression: source,
                 r#type: *r#type,
             }
@@ -287,16 +259,26 @@ pub(crate) fn any_diag_from_infer_diagnostic(
         InferenceDiagnosticKind::NoConstructor {
             expression,
             r#type,
-            builtins,
             parameters,
         } => {
             let pointer = source_map.expression_to_source(*expression).ok()?.clone();
             let source = InFile::new(file_id, pointer);
-
             AnyDiagnostic::NoConstructor {
                 expression: source,
-                builtins: *builtins,
                 r#type: *r#type,
+                parameters: parameters.clone(),
+            }
+        },
+        InferenceDiagnosticKind::NoOverload {
+            expression,
+            parameters,
+            name,
+        } => {
+            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
+            let source = InFile::new(file_id, pointer);
+            AnyDiagnostic::NoOverload {
+                expression: source,
+                name: name.clone(),
                 parameters: parameters.clone(),
             }
         },
@@ -307,45 +289,10 @@ pub(crate) fn any_diag_from_infer_diagnostic(
         } => {
             let pointer = source_map.expression_to_source(*expression).ok()?.clone();
             let source = InFile::new(file_id, pointer);
-
             AnyDiagnostic::FunctionCallArgCountMismatch {
                 expression: source,
                 n_expected: *n_expected,
                 n_actual: *n_actual,
-            }
-        },
-        InferenceDiagnosticKind::NoBuiltinOverload {
-            expression,
-            builtin,
-            parameters,
-            name,
-        } => {
-            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
-            let source = InFile::new(file_id, pointer);
-
-            AnyDiagnostic::NoBuiltinOverload {
-                expression: source,
-                builtin: *builtin,
-                name: *name,
-                parameters: parameters.clone(),
-            }
-        },
-        InferenceDiagnosticKind::AddressOfNotReference { expression, actual } => {
-            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
-            let source = InFile::new(file_id, pointer);
-
-            AnyDiagnostic::AddressOfNotReference {
-                expression: source,
-                actual: *actual,
-            }
-        },
-        InferenceDiagnosticKind::DerefNotAPointer { expression, actual } => {
-            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
-            let source = InFile::new(file_id, pointer);
-
-            AnyDiagnostic::DerefNotPointer {
-                expression: source,
-                actual: *actual,
             }
         },
         InferenceDiagnosticKind::InvalidType {
@@ -354,7 +301,6 @@ pub(crate) fn any_diag_from_infer_diagnostic(
             TypeContainer::Expression(expression) => {
                 let pointer = source_map.expression_to_source(*expression).ok()?.clone();
                 let source = InFile::new(file_id, pointer);
-
                 AnyDiagnostic::InvalidIdentExpression {
                     expression: source,
                     error: kind.clone(),
@@ -393,7 +339,7 @@ pub(crate) fn any_diag_from_infer_diagnostic(
                 message: message.clone(),
             }
         },
-        InferenceDiagnosticKind::ExpectedLoweredKind {
+        InferenceDiagnosticKind::UnexpectedLoweredKind {
             expression,
             expected,
             actual,
@@ -408,27 +354,48 @@ pub(crate) fn any_diag_from_infer_diagnostic(
                 actual: *actual,
             }
         },
+        InferenceDiagnosticKind::StoreTypeMustBeStorable { actual, expression } => {
+            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
+            let source = InFile::new(file_id, pointer);
+            AnyDiagnostic::StoreTypeMustBeStorable {
+                expression: source,
+                actual: *actual,
+            }
+        },
+        InferenceDiagnosticKind::UnexpectedReturnValue { expression, actual } => {
+            let pointer = source_map.expression_to_source(*expression).ok()?.clone();
+            let source = InFile::new(file_id, pointer);
+            AnyDiagnostic::UnexpectedReturnValue {
+                expression: source,
+                actual: *actual,
+            }
+        },
     })
 }
 
 pub(crate) fn any_diag_from_def_diagnostic(
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     def_diagnostic: &DefDiagnostic,
-    file_id: EditionedFileId,
 ) -> AnyDiagnostic {
     match &def_diagnostic.kind {
-        DefDiagnosticKind::UnresolvedImport { id, name } => AnyDiagnostic::UnresolvedImport {
-            id: id.ast_ptr(database),
+        DefDiagnosticKind::UnnamedImport { id } => {
+            AnyDiagnostic::UnnamedImport { id: id.ast_ptr(db) }
+        },
+        DefDiagnosticKind::UnresolvedPackage { id, name } => AnyDiagnostic::UnresolvedPackage {
+            id: id.ast_ptr(db),
             name: name.clone(),
         },
-        DefDiagnosticKind::TooManySupers { id } => AnyDiagnostic::TooManySupers {
-            id: id.ast_ptr(database),
+        DefDiagnosticKind::UnresolvedImport { id } => {
+            AnyDiagnostic::UnresolvedImport { id: id.ast_ptr(db) }
         },
-        DefDiagnosticKind::DetachedFile { id } => AnyDiagnostic::DetachedFile {
-            id: id.ast_ptr(database),
+        DefDiagnosticKind::TooManySupers { id } => {
+            AnyDiagnostic::TooManySupers { id: id.ast_ptr(db) }
+        },
+        DefDiagnosticKind::DetachedFile { id } => {
+            AnyDiagnostic::DetachedFile { id: id.ast_ptr(db) }
         },
         DefDiagnosticKind::NameConflict { item, previous } => AnyDiagnostic::NameConflict {
-            item: item.ast_ptr(database),
+            item: item.ast_ptr(db),
             name: previous.clone(),
         },
     }

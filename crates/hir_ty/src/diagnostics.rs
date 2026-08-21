@@ -5,7 +5,6 @@ use hir_def::{
 };
 
 use crate::{
-    builtins::BuiltinId,
     infer::TypeExpectation,
     lower::{LoweredKind, TypeLoweringError},
     ty::Type,
@@ -37,11 +36,7 @@ pub enum InferenceDiagnosticKind {
         expression: ExpressionId,
         r#type: Type,
     },
-    UnresolvedName {
-        expression: ExpressionId,
-        name: Name,
-    },
-    InvalidConstructionType {
+    NotConstructible {
         expression: ExpressionId,
         r#type: Type,
     },
@@ -50,23 +45,17 @@ pub enum InferenceDiagnosticKind {
         n_expected: usize,
         n_actual: usize,
     },
-    NoBuiltinOverload {
-        expression: ExpressionId,
-        builtin: BuiltinId,
-        name: Option<&'static str>,
-        parameters: Vec<Type>,
-    },
     NoConstructor {
         expression: ExpressionId,
-        builtins: BuiltinId,
         r#type: Type,
         parameters: Vec<Type>,
     },
-    AddressOfNotReference {
+    NoOverload {
         expression: ExpressionId,
-        actual: Type,
+        name: Name,
+        parameters: Vec<Type>,
     },
-    DerefNotAPointer {
+    StoreTypeMustBeStorable {
         expression: ExpressionId,
         actual: Type,
     },
@@ -84,10 +73,14 @@ pub enum InferenceDiagnosticKind {
         expression: ExpressionId,
         message: String,
     },
-    ExpectedLoweredKind {
+    UnexpectedLoweredKind {
         expression: ExpressionId,
         expected: LoweredKind,
         actual: LoweredKind,
         path: Path,
+    },
+    UnexpectedReturnValue {
+        expression: ExpressionId,
+        actual: Type,
     },
 }

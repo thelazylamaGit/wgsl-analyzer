@@ -1,17 +1,15 @@
 use std::collections::VecDeque;
 
+use base_db::Intern as _;
 use hir_def::expression::{BinaryOperation, Expression, ExpressionId, UnaryOperator};
-use wgsl_types::{
-    inst::{Instance, LiteralInstance},
-    syntax::Enumerant,
-};
+use wgsl_types::inst::{Instance, LiteralInstance};
 
 use crate::{
     lower::{
         Lowered, TypeContainer, TypeLoweringContext, TypeLoweringError, TypeLoweringErrorKind,
         generics::{TemplateParameter, TemplateParameters},
     },
-    ty::{Type, TypeKind},
+    ty::TypeKind,
 };
 
 impl TypeLoweringContext<'_> {
@@ -139,15 +137,18 @@ impl TypeLoweringContext<'_> {
                 );
                 match resolved_type {
                     Lowered::Type(r#type) => TemplateParameter::Type(r#type),
-                    Lowered::TypeWithoutTemplate(_) => {
+                    Lowered::ConstructibleTypeGenerator(_) => {
                         self.diagnostics.push(TypeLoweringError {
                             container: TypeContainer::Expression(template_argument),
                             kind: TypeLoweringErrorKind::MissingTemplate,
                         });
-                        TemplateParameter::Type(TypeKind::Error.intern(self.database))
+                        TemplateParameter::Type(TypeKind::Error.intern(self.db))
                     },
                     Lowered::Enumerant(enumerant) => TemplateParameter::Enumerant(enumerant),
-                    Lowered::Function(_) | Lowered::BuiltinFunction => {
+                    Lowered::Function(_)
+                    | Lowered::BuiltinFunction(_, _)
+                    // | Lowered::BuiltinConstructor(_, _)
+                    => {
                         // function<another_function>()
                         self.diagnostics.push(TypeLoweringError {
                             container: TypeContainer::Expression(template_argument),
@@ -155,13 +156,16 @@ impl TypeLoweringContext<'_> {
                                 ident_expression.path.clone(),
                             ),
                         });
-                        TemplateParameter::Type(self.database.intern_type(TypeKind::Error))
+                        TemplateParameter::Type(TypeKind::Error.intern(self.db))
                     },
                     Lowered::GlobalConstant(_)
                     | Lowered::GlobalVariable(_)
                     | Lowered::Override(_)
                     | Lowered::Local(_) => {
                         TemplateParameter::Instance(self.eval_expression(template_argument))
+                    },
+                    Lowered::BuiltinDeclaration(_, value) => {
+                        TemplateParameter::Instance(Some(value))
                     },
                 }
             },
@@ -186,7 +190,6 @@ impl TypeLoweringContext<'_> {
             .iter()
             .map(|argument| (self.evaluate_template_argument(*argument), *argument))
             .collect();
-        let length = template_parameters.len();
         TemplateParameters::new(container, template_parameters)
     }
 }

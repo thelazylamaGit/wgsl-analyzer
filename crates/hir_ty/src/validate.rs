@@ -4,7 +4,10 @@ use itertools::Itertools as _;
 use smallvec::{SmallVec, smallvec};
 use wgsl_types::syntax::{AccessMode, AddressSpace};
 
-use crate::{database::HirDatabase, ty::TypeKind};
+use crate::{
+    db::HirDatabase,
+    ty::{ArrayType, TypeKind},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
@@ -33,6 +36,7 @@ pub enum AddressSpaceError {
     /// Plain type, excluding runtime-sized arrays.
     WorkgroupCompatible,
     HandleOrTexture,
+    TaskPayloadCompatible,
 }
 
 impl fmt::Display for AddressSpaceError {
@@ -59,6 +63,9 @@ impl fmt::Display for AddressSpaceError {
             Self::HandleOrTexture => {
                 formatter.write_str("address space is only valid for handle or texture types")
             },
+            Self::TaskPayloadCompatible => {
+                formatter.write_str("type is not compatible with `task_payload` address space")
+            },
         }
     }
 }
@@ -70,13 +77,13 @@ pub fn validate_address_space<DiagnosticBuilder>(
     access_mode: AccessMode,
     scope: Scope,
     r#type: &TypeKind,
-    database: &dyn HirDatabase,
+    db: &dyn HirDatabase,
     mut diagnostic_builder: DiagnosticBuilder,
 ) where
     DiagnosticBuilder: FnMut(AddressSpaceError),
 {
     // We only care about the inner type here
-    let r#type = r#type.unref(database);
+    let r#type = r#type.unref(db);
     match address_space {
         AddressSpace::Function => {
             if !matches!(scope, Scope::Function) {
@@ -113,8 +120,7 @@ pub fn validate_address_space<DiagnosticBuilder>(
                     AccessMode::ReadWrite
                 ]));
             }
-            if !r#type.is_error()
-                && (!r#type.is_plain() || r#type.contains_runtime_sized_array(database))
+            if !r#type.is_error() && (!r#type.is_plain() || r#type.contains_runtime_sized_array(db))
             {
                 diagnostic_builder(AddressSpaceError::WorkgroupCompatible);
             }
@@ -128,7 +134,7 @@ pub fn validate_address_space<DiagnosticBuilder>(
                     AccessMode::ReadWrite
                 ]));
             }
-            if !r#type.is_error() && !r#type.is_host_shareable(database) {
+            if !r#type.is_error() && !r#type.is_host_shareable(db) {
                 diagnostic_builder(AddressSpaceError::HostShareable);
             }
             if !r#type.is_error() && !r#type.is_constructable() {
@@ -144,7 +150,7 @@ pub fn validate_address_space<DiagnosticBuilder>(
                     AccessMode::ReadWrite
                 ]));
             }
-            if !r#type.is_error() && !r#type.is_host_shareable(database) {
+            if !r#type.is_error() && !r#type.is_host_shareable(db) {
                 diagnostic_builder(AddressSpaceError::HostShareable);
             }
         },
@@ -158,18 +164,22 @@ pub fn validate_address_space<DiagnosticBuilder>(
                 ]));
             }
             match r#type.as_ref() {
-                TypeKind::Sampler(_) | TypeKind::Texture(_) => {},
+                TypeKind::Sampler(_)
+                | TypeKind::Texture(_)
+                | TypeKind::Array(ArrayType {
+                    binding_array: true,
+                    ..
+                }) => {},
                 TypeKind::Error
                 | TypeKind::Scalar(_)
                 | TypeKind::Atomic(_)
                 | TypeKind::Vector(_)
                 | TypeKind::Matrix(_)
                 | TypeKind::Struct(_)
+                | TypeKind::BuiltinStruct(_)
                 | TypeKind::Array(_)
                 | TypeKind::Reference(_)
-                | TypeKind::Pointer(_)
-                | TypeKind::BoundVariable(_)
-                | TypeKind::StorageTypeOfTexelFormat(_) => {
+                | TypeKind::Pointer(_) => {
                     diagnostic_builder(AddressSpaceError::HandleOrTexture);
                 },
             }
@@ -177,6 +187,20 @@ pub fn validate_address_space<DiagnosticBuilder>(
         AddressSpace::Immediate => {
             // TODO: validate immediates
             // See: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/682
+        },
+        AddressSpace::TaskPayload => {
+            if !matches!(scope, Scope::Module) {
+                diagnostic_builder(AddressSpaceError::Scope(Scope::Module));
+            }
+            // TODO: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/1360
+            // if is_mesh_shader {
+            //     if !matches!(access_mode, AccessMode::Read) {
+            //         diagnostic_builder(AddressSpaceError::AccessMode(smallvec![AccessMode::Read]));
+            //     }
+            // }
+            if !r#type.is_error() && r#type.size_of(address_space, db) < Some(4) {
+                diagnostic_builder(AddressSpaceError::TaskPayloadCompatible);
+            }
         },
     }
 }

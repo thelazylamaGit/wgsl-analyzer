@@ -1,6 +1,6 @@
 use std::iter;
 
-use hir_def::database::DefDatabase as _;
+use hir_def::signature::StructSignature;
 use hir_ty::ty::TypeKind;
 
 use super::Completions;
@@ -13,6 +13,7 @@ pub(crate) fn complete_dot(
     accumulator: &mut Completions,
     context: &CompletionContext<'_>,
 ) -> Option<()> {
+    let _p = tracing::info_span!("complete_dot").entered();
     let Some(ImmediateLocation::FieldAccess { expression }) = &context.completion_location else {
         return Some(());
     };
@@ -24,16 +25,44 @@ pub(crate) fn complete_dot(
                 .and_then(hir::ChildContainer::as_def_with_body_id)?,
         )
         .type_of_expression(&expression.expression()?)?
-        .kind(context.database)
-        .unref(context.database)
-        .as_ref()
+        .kind(context.db)
     {
         TypeKind::Vector(vector) => {
-            vector_completions(accumulator, context, expression, vector);
+            vector_completions(accumulator, context, expression, &vector);
             Some(())
         },
         TypeKind::Struct(r#struct) => {
-            struct_completions(accumulator, context, *r#struct);
+            struct_completions(accumulator, context, r#struct);
+            Some(())
+        },
+        TypeKind::Reference(hir_ty::ty::Reference {
+            address_space,
+            inner,
+            access_mode,
+        })
+        | TypeKind::Pointer(hir_ty::ty::Pointer {
+            address_space,
+            inner,
+            access_mode,
+        }) if let TypeKind::Vector(vector) = inner.kind(context.db) => {
+            vector_completions(accumulator, context, expression, &vector);
+            Some(())
+        },
+        TypeKind::Reference(hir_ty::ty::Reference {
+            address_space,
+            inner,
+            access_mode,
+        })
+        | TypeKind::Pointer(hir_ty::ty::Pointer {
+            address_space,
+            inner,
+            access_mode,
+        }) if let TypeKind::Struct(r#struct) = inner.kind(context.db) => {
+            struct_completions(accumulator, context, r#struct);
+            Some(())
+        },
+        TypeKind::BuiltinStruct(builtin_struct) => {
+            builtin_struct_completions(accumulator, context, &builtin_struct);
             Some(())
         },
         TypeKind::Error
@@ -44,27 +73,43 @@ pub(crate) fn complete_dot(
         | TypeKind::Texture(_)
         | TypeKind::Sampler(_)
         | TypeKind::Reference(_)
-        | TypeKind::Pointer(_)
-        | TypeKind::BoundVariable(_)
-        | TypeKind::StorageTypeOfTexelFormat(_) => None,
+        | TypeKind::Pointer(_) => None,
     }
 }
 
 fn struct_completions(
     accumulator: &mut Completions,
     context: &CompletionContext<'_>,
-    r#struct: hir_def::database::StructId,
+    r#struct: hir_def::db::StructId,
 ) {
     let field_completion_item = |name| {
         CompletionItem::new(CompletionItemKind::Field, context.source_range(), name)
-            .build(context.database)
+            .build(context.db)
     };
 
-    let r#struct = context.database.struct_data(r#struct).0;
+    let r#struct = StructSignature::of(context.db, r#struct);
     let items = r#struct
         .fields()
         .iter()
         .map(|(_, field)| field.name.as_str())
+        .map(field_completion_item);
+    accumulator.add_all(items);
+}
+
+fn builtin_struct_completions(
+    accumulator: &mut Completions,
+    context: &CompletionContext<'_>,
+    builtin_struct: &hir_ty::ty::BuiltinStruct,
+) {
+    let field_completion_item = |name| {
+        CompletionItem::new(CompletionItemKind::Field, context.source_range(), name)
+            .build(context.db)
+    };
+
+    let items = builtin_struct
+        .fields
+        .iter()
+        .map(|(name, _)| name.as_str())
         .map(field_completion_item);
     accumulator.add_all(items);
 }
@@ -91,7 +136,7 @@ fn vector_completions(
         let suggestions = possible_swizzles.map(|label| {
             let binding =
                 CompletionItem::new(CompletionItemKind::Field, context.source_range(), label);
-            binding.build(context.database)
+            binding.build(context.db)
         });
         accumulator.add_all(suggestions);
     }

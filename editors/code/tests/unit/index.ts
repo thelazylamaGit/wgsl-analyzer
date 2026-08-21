@@ -1,7 +1,7 @@
 import * as assert from "node:assert/strict";
-import { readdir } from "fs/promises";
-import * as path from "path";
-import { pathToFileURL } from "url";
+import { readdir } from "node:fs/promises";
+import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 class Test {
 	readonly name: string;
@@ -81,7 +81,8 @@ export async function run(): Promise<void> {
 	);
 	for (const testFile of testFiles) {
 		try {
-			const testModule = await import(pathToFileURL(path.resolve(__dirname, testFile)).href);
+			const moduleUrl = pathToFileURL(path.resolve(__dirname, testFile)).href;
+			const testModule = await import(moduleUrl);
 			await testModule.getTests(context);
 		} catch (exception) {
 			assert.ok(exception instanceof Error);

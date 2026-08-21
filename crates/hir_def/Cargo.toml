@@ -12,10 +12,11 @@ doctest = false
 
 [dependencies]
 base-db.workspace = true
+camino.workspace = true
 either.workspace = true
 indexmap.workspace = true
+itertools.workspace = true
 la-arena.workspace = true
-query-group.workspace = true
 rowan.workspace = true
 rustc-hash.workspace = true
 salsa.workspace = true
@@ -24,7 +25,7 @@ smallvec.workspace = true
 smol_str.workspace = true
 syntax.workspace = true
 triomphe.workspace = true
-vfs.workspace = true
+wgsl-types.workspace = true
 
 [dev-dependencies]
 expect-test.workspace = true

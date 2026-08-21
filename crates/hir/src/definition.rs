@@ -1,10 +1,12 @@
 use base_db::EditionedFileId;
-use hir_def::{expression_store::path::Path, mod_path::ModPath, resolver::ResolveKind};
+use hir_def::{
+    expression_store::path::Path, item_tree::Name, mod_path::ModPath, resolver::ResolveKind,
+};
 use syntax::{AstNode as _, SyntaxNode, SyntaxToken, ast, match_ast};
 
 use crate::{
-    Field, Function, GlobalConstant, GlobalVariable, Local, Module, ModuleDef, Override, Semantics,
-    Struct, TypeAlias,
+    Field, Function, GlobalConstant, GlobalVariable, Local, ModuleDef, Override, Semantics, Struct,
+    TypeAlias,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +14,12 @@ pub enum Definition {
     Local(Local),
     Field(Field),
     ModuleDef(ModuleDef),
+    BuiltinFunction(Name),
+    BuiltinType(Name),
+    BuiltinTypeGenerator(Name),
+    // BuiltinTypeConstructor(Name),
+    BuiltinEnumerant(Name),
+    BuiltinDeclaration(Name),
 }
 
 impl Definition {
@@ -50,9 +58,6 @@ impl Definition {
 impl From<ResolveKind> for Definition {
     fn from(value: ResolveKind) -> Self {
         match value {
-            ResolveKind::Module(module_id) => {
-                Self::ModuleDef(ModuleDef::Module(Module { file_id: module_id }))
-            },
             ResolveKind::Local(binding, parent) => Self::Local(Local { parent, binding }),
             ResolveKind::GlobalVariable(id) => {
                 Self::ModuleDef(ModuleDef::GlobalVariable(GlobalVariable { id }))
@@ -64,6 +69,12 @@ impl From<ResolveKind> for Definition {
             ResolveKind::Struct(id) => Self::ModuleDef(ModuleDef::Struct(Struct { id })),
             ResolveKind::TypeAlias(id) => Self::ModuleDef(ModuleDef::TypeAlias(TypeAlias { id })),
             ResolveKind::Function(id) => Self::ModuleDef(ModuleDef::Function(Function { id })),
+            ResolveKind::BuiltinFunction(name) => Self::BuiltinFunction(name),
+            ResolveKind::BuiltinType(name) => Self::BuiltinType(name),
+            ResolveKind::BuiltinTypeGenerator(name) => Self::BuiltinTypeGenerator(name),
+            // ResolveKind::BuiltinTypeConstructor(name) => Self::BuiltinTypeConstructor(name),
+            ResolveKind::BuiltinEnumerant(name) => Self::BuiltinEnumerant(name),
+            ResolveKind::BuiltinDeclaration(name) => Self::BuiltinDeclaration(name),
         }
     }
 }
@@ -79,7 +90,7 @@ fn resolve_path(
     {
         let resolver = semantics.resolver(file_id, path.syntax());
         resolver
-            .resolve(semantics.database, &Path(ModPath::from_src(path)))
+            .resolve(semantics.db, &Path(ModPath::from_src(path)))
             .ok()
             .map(Definition::from)
     } else if let Some(expression) = ast::FieldExpression::cast(parent) {

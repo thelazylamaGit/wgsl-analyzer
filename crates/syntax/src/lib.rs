@@ -8,12 +8,14 @@ use std::{marker::PhantomData, ops::Deref};
 
 use either::Either;
 pub use parser::{
-    Diagnostic, Edition, ExtensionsConfig, ParseEntryPoint, SyntaxElement, SyntaxKind, SyntaxNode,
-    SyntaxNodeChildren, SyntaxToken,
+    Capabilities, Diagnostic, Edition, ExtensionsConfig, ParseEntryPoint, SyntaxElement,
+    SyntaxKind, SyntaxNode, SyntaxNodeChildren, SyntaxToken,
 };
 pub use rowan::Direction;
 use smol_str::SmolStr;
 use triomphe::Arc;
+
+use crate::ast::{Attribute, AttributeList};
 
 #[derive(Clone, Debug)]
 pub struct Parse {
@@ -66,8 +68,13 @@ pub fn parse(
     input: &str,
     edition: Edition,
 ) -> Parse {
-    let (green_node, errors) =
-        parser::parse_entrypoint(input, ParseEntryPoint::File, edition).into_parts();
+    let (green_node, errors) = parser::parse_entrypoint_with_capabilities(
+        input,
+        ParseEntryPoint::File,
+        edition,
+        Capabilities::default(),
+    )
+    .into_parts();
     Parse {
         green_node,
         errors: Arc::from(errors),
@@ -256,8 +263,12 @@ pub trait HasTemplateParameters: AstNode {
 }
 
 pub trait HasAttributes: AstNode {
-    fn attributes(&self) -> AstChildren<ast::Attribute> {
-        support::children(self.syntax())
+    fn attributes(&self) -> Option<AstChildren<ast::Attribute>> {
+        let prev_sibling = self.syntax().prev_sibling()?;
+        if let Some(node) = AttributeList::cast(prev_sibling) {
+            return Some(node.attributes());
+        }
+        None
     }
 }
 

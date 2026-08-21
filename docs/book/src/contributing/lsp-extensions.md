@@ -1,7 +1,7 @@
 # LSP Extensions
 
 <!---
-crates/wgsl-analyzer/src/lsp/extensions.rs hash: a2fcb0c9c05299e6
+crates/wgsl-analyzer/src/lsp/extensions.rs hash: 820e88c3a7f834e0
 
 If you need to change the above hash to make the test pass, please check whether you
 need to adjust this doc as well and ping this issue:

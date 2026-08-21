@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use ide::{Analysis, AnalysisHost, Cancellable};
 use lsp_server::{Notification as ServerNotification, Request as ServerRequest};
 use lsp_types::{
-    Diagnostic, Notification as LspNotification, PublishDiagnosticsNotification,
+    Diagnostic, MarkupContent, Notification as LspNotification, PublishDiagnosticsNotification,
     PublishDiagnosticsParams, Request as LspRequest, Uri,
 };
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -18,10 +18,7 @@ use rustc_hash::FxHashMap;
 use salsa::Revision;
 use tracing::Level;
 use triomphe::Arc;
-use vfs::{
-    Change as VfsChange, FileExcluded, FileId, Vfs, VfsPath,
-    loader::{Handle, Message},
-};
+use vfs::{AbsPathBuf, Change as VfsChange, FileExcluded, FileId, Vfs, VfsPath, loader::Handle};
 use vfs_notify::NotifyHandle;
 
 use crate::{
@@ -71,7 +68,7 @@ pub(crate) struct GlobalState {
     pub(crate) load_package_jobs_active: u32,
 
     // VFS
-    pub(crate) loader: HandleReceiver<Box<dyn Handle>, Receiver<Message>>,
+    pub(crate) loader: HandleReceiver<Box<dyn Handle>, Receiver<vfs::loader::Message>>,
     pub(crate) vfs: Arc<RwLock<(Vfs, FxHashMap<FileId, LineEndings>)>>,
     pub(crate) vfs_config_version: u32,
     pub(crate) vfs_progress_config_version: u32,
@@ -81,7 +78,6 @@ pub(crate) struct GlobalState {
     pub(crate) vfs_span: Option<tracing::span::EnteredSpan>,
     pub(crate) wants_to_switch: Option<Cause>,
 
-    // pub(crate) vfs_config_version: u32,
     pub(crate) analysis_host: AnalysisHost,
     pub(crate) diagnostics: DiagnosticCollection,
     pub(crate) in_memory_documents: InMemoryDocuments,
@@ -128,7 +124,7 @@ impl GlobalState {
         config: Config,
     ) -> Self {
         let loader = {
-            let (sender, receiver) = unbounded::<Message>();
+            let (sender, receiver) = unbounded::<vfs::loader::Message>();
             let handle: NotifyHandle = Handle::spawn(sender);
             #[expect(clippy::as_conversions, reason = "tested to be valid")]
             let handle = Box::new(handle) as Box<dyn Handle>;
@@ -155,7 +151,7 @@ impl GlobalState {
         // if let Some(capacities) = config.lru_query_capacities_config() {
         //     analysis_host.update_lru_capacities(capacities);
         // }
-        analysis_host.update_extensions(config.extensions());
+        analysis_host.update_capabilities(config.capabilities());
 
         // let (flycheck_sender, flycheck_receiver) = unbounded();
         // let (test_run_sender, test_run_receiver) = unbounded();
@@ -278,8 +274,15 @@ impl GlobalState {
         }
         std::mem::drop(guard);
 
-        // Package graph changes
-        self.process_package_changes(modified_local_packages, &mut change);
+        if !modified_local_packages.is_empty() {
+            self.process_local_package_changes(modified_local_packages);
+        }
+        if self.is_quiescent() {
+            // Delay switching until
+            // - the package graph is fully loaded
+            // - and the root file is loaded
+            self.process_package_changes(&mut change);
+        }
 
         if change.is_empty() {
             false
@@ -289,12 +292,10 @@ impl GlobalState {
         }
     }
 
-    fn process_package_changes(
+    fn process_local_package_changes(
         &self,
         modified_local_packages: FxHashMap<ManifestPath, PackageChange>,
-        change: &mut BaseDbChange,
     ) {
-        let (vfs, _) = &*self.vfs.read();
         let packages = &mut *self.packages.write();
         for (path, modified) in modified_local_packages {
             match modified {
@@ -327,49 +328,48 @@ impl GlobalState {
                 },
             }
         }
+    }
 
+    fn process_package_changes(
+        &self,
+        change: &mut BaseDbChange,
+    ) {
+        let mut packages = self.packages.write();
+        let vfs = &self.vfs.read().0;
         let changed_packages = packages.take_changes();
         for (id, package_change) in changed_packages {
+            // TODO: Report the tracing::errors via diagnostics instead
+            // See: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/1373
+
             let package_data = packages.get(id).and_then(|package| {
-                let vfs_path = match &package.root {
-                    WeslPackageRoot::File(path) => vfs::VfsPath::from(path.clone()),
-                    WeslPackageRoot::Folder(path) => {
-                        // TODO: Support folders as the root https://github.com/wgsl-analyzer/wgsl-analyzer/issues/992
-                        tracing::error!(
-                            "Folders as the root are not supported at the moment {}",
-                            path
-                        );
-                        return None;
-                    },
-                };
-                let Some((root_file_id, root_file_excluded)) = vfs.file_id(&vfs_path) else {
-                    // TODO: Properly report the error
-                    tracing::error!("Could not find root file {}", &vfs_path);
+                let manifest_path = vfs::VfsPath::from(AbsPathBuf::from(package.manifest.clone()));
+                let Some((manifest_file_id, root_file_excluded)) = vfs.file_id(&manifest_path)
+                else {
+                    tracing::error!("Could not find manifest file {}", &package.manifest);
                     return None;
                 };
                 if root_file_excluded == FileExcluded::Yes {
                     return None;
                 }
-
                 let dependencies = package
                     .dependencies
                     .iter()
                     .filter_map(|dependency| {
-                        // TODO: Properly report the errors
-                        let Some(package_id) = packages.package_id(&dependency.pkg) else {
-                            tracing::error!("Could not find dependency {}", &dependency.name);
+                        let Some(package_id) = packages.package_id(&dependency.package_key())
+                        else {
+                            tracing::error!("Could not find dependency {}", dependency.name());
                             return None;
                         };
-                        let Ok(name) = PackageName::new(&dependency.name) else {
-                            tracing::error!("Invalid dependency name {}", &dependency.name);
-                            return None;
-                        };
-                        Some(Dependency { package_id, name })
+                        Some(Dependency {
+                            package_id,
+                            name: dependency.name().clone(),
+                        })
                     })
                     .collect();
 
                 Some(PackageData {
-                    root_file_id,
+                    manifest_file_id,
+                    root: vfs::VfsPath::from(package.root.clone()),
                     edition: package.edition,
                     display_name: package.display_name.clone(),
                     dependencies,
@@ -378,6 +378,7 @@ impl GlobalState {
             });
             change.change_package(id, package_data);
         }
+        std::mem::drop(packages);
     }
 
     pub(crate) fn snapshot(&self) -> GlobalStateSnapshot {
@@ -445,7 +446,7 @@ impl GlobalState {
         response: lsp_server::Response,
     ) {
         if let Some((method, start)) = self.request_queue.incoming.complete(&response.id) {
-            if let Some(error) = &response.error
+            if let Err(error) = &response.response_result
                 && error.message.starts_with("server panicked")
             {
                 self.poke_wgsl_analyzer_developer(format!("{}, check the log", error.message));
@@ -501,17 +502,28 @@ impl GlobalState {
 
                     // See https://github.com/rust-lang/rust-analyzer/issues/11404
                     // See https://github.com/rust-lang/rust-analyzer/issues/13130
-                    let patch_empty = |message: &mut String| {
-                        if message.is_empty() {
+                    let patch_empty = |message: &mut lsp_types::Message| match message {
+                        lsp_types::Message::String(message) if message.is_empty() => {
                             " ".clone_into(message);
-                        }
+                        },
+                        lsp_types::Message::MarkupContent(lsp_types::MarkupContent {
+                            value,
+                            kind: _,
+                        }) if value.is_empty() => {
+                            " ".clone_into(value);
+                        },
+                        lsp_types::Message::String(_) | lsp_types::Message::MarkupContent(_) => {},
                     };
 
                     for diagnostic in &mut diagnostics {
                         patch_empty(&mut diagnostic.message);
                         if let Some(dri) = &mut diagnostic.related_information {
                             for dri in dri {
-                                patch_empty(&mut dri.message);
+                                // The LSP does not (yet?) specify that related diagnostic messages can
+                                // be in Markdown format (in addition to plain text).
+                                if dri.message.is_empty() {
+                                    " ".clone_into(&mut dri.message);
+                                }
                             }
                         }
                     }
@@ -565,7 +577,7 @@ impl GlobalStateSnapshot {
         let result = LineIndex {
             index,
             endings,
-            encoding: self.config.capabilities().negotiated_encoding(),
+            encoding: self.config.client_capabilities().negotiated_encoding(),
         };
         Ok(result)
     }

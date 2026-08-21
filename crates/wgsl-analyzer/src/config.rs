@@ -1,7 +1,6 @@
 use std::{fmt, sync::OnceLock};
 
-use base_db::{ExtensionsConfig, input::SourceRootId};
-use hir::diagnostics::{DiagnosticsConfig, NagaVersion};
+use base_db::{Capabilities, input::SourceRootId};
 use hir_ty::ty::pretty::TypeVerbosity;
 use ide::{
     HoverConfig, HoverDocFormat, MemoryLayoutHoverRenderKind,
@@ -31,10 +30,11 @@ use ide::{
 };
 use ide_completion::{CompletionConfig, CompletionFieldsToResolve};
 use ide_db::SnippetCapability;
+use ide_diagnostics::{DiagnosticsConfig, NagaVersion};
 use itertools::Itertools as _;
 use lsp_types::{ClientCapabilities as LspClientCapabilities, ClientInfo};
+use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
-use semver::Version;
 use serde::{Deserialize, Serialize};
 use stdx::format_to_acc;
 use triomphe::Arc;
@@ -62,14 +62,21 @@ config_data! {
         /// Use `0` to let the server choose automatically based on the machine.
         cachePriming_numThreads: NumThreads = NumThreads::default(),
 
-        /// Controls whether to show naga's parsing errors.
-        diagnostics_nagaParsingErrors: bool = true,
-        /// Controls whether to show naga's validation errors.
-        diagnostics_nagaValidationErrors: bool = true,
+        // TODO: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/998
+        // `diagnostics_external` becomes `check` or similar
+        /// Whether to show diagnostics from naga about parsing.
+        diagnostics_external_naga_parsing: bool = true,
+        /// Whether to show diagnostics from naga about validation.
+        diagnostics_external_naga_validation_errors: bool = true,
         /// Naga version used for validation.
-        diagnostics_nagaVersion: NagaVersionConfig = NagaVersionConfig::default(),
-        /// Controls whether to show type errors.
-        diagnostics_typeErrors: bool = true,
+        diagnostics_external_naga_version: NagaVersionConfig = NagaVersionConfig::default(),
+        /// Whether to show Tint shader compiler's messages.
+        diagnostics_external_tintErrors: bool = false,
+        /// The path to the tint binary.
+        diagnostics_external_tintPath: Option<Utf8PathBuf> = None,
+
+        /// Whether to show diagnostics about the code semantics.
+        diagnostics_semanticErrors: bool = true,
 
         // TODO: remove this, this is not config
         /// Whether to enable u64 and i64 scalar types.
@@ -147,7 +154,7 @@ pub enum TraceServer {
 pub struct Config {
     /// The workspace roots as registered by the LSP client.
     workspace_roots: Vec<AbsPathBuf>,
-    capabilities: ClientCapabilities,
+    client_capabilities: ClientCapabilities,
     /// The LSP root path, deprecated in favor of `workspace_roots`.
     root_path: AbsPathBuf,
     // TODO: https://github.com/wgsl-analyzer/wgsl-analyzer/issues/921
@@ -201,7 +208,7 @@ impl std::ops::Deref for Config {
     type Target = ClientCapabilities;
 
     fn deref(&self) -> &Self::Target {
-        &self.capabilities
+        &self.client_capabilities
     }
 }
 
@@ -267,7 +274,7 @@ impl Config {
 
         Self {
             workspace_roots,
-            capabilities: ClientCapabilities::new(capabilities),
+            client_capabilities: ClientCapabilities::new(capabilities),
             // snippets: Default::default(),
             root_path,
             client_info,
@@ -410,8 +417,8 @@ impl Config {
     }
 
     #[must_use]
-    pub const fn capabilities(&self) -> &ClientCapabilities {
-        &self.capabilities
+    pub const fn client_capabilities(&self) -> &ClientCapabilities {
+        &self.client_capabilities
     }
 
     #[must_use]
@@ -478,7 +485,7 @@ impl Config {
 
     #[must_use]
     pub fn hover_actions(&self) -> HoverActionsConfig {
-        let enable = self.capabilities.hover_actions();
+        let enable = self.client_capabilities.hover_actions();
         HoverActionsConfig {
             implementations: enable,
             references: enable,
@@ -541,8 +548,8 @@ impl Config {
     }
 
     #[must_use]
-    pub fn extensions(&self) -> ExtensionsConfig {
-        ExtensionsConfig {
+    pub fn capabilities(&self) -> Capabilities {
+        Capabilities {
             shader_int64: *self.extensions_shaderInt64(),
             ..Default::default()
         }
@@ -580,17 +587,24 @@ impl Config {
         &self,
         source_root: Option<SourceRootId>,
     ) -> DiagnosticsConfig {
+        let tint_path = self
+            .diagnostics_external_tintPath()
+            .as_deref()
+            .unwrap_or_else(|| "tint".into());
         DiagnosticsConfig {
             enabled: true,
-            type_errors: *self.diagnostics_typeErrors(),
-            naga_parsing_errors: *self.diagnostics_nagaParsingErrors(),
-            naga_validation_errors: *self.diagnostics_nagaValidationErrors(),
-            naga_version: match self.diagnostics_nagaVersion() {
+            parse_enabled: true,
+            semantic_enabled: *self.diagnostics_semanticErrors(),
+            naga_parsing_enabled: *self.diagnostics_external_naga_parsing(),
+            naga_validation_enabled: *self.diagnostics_external_naga_validation_errors(),
+            naga_version: match self.diagnostics_external_naga_version() {
                 NagaVersionConfig::Naga27 => NagaVersion::Naga27,
                 NagaVersionConfig::Naga28 => NagaVersion::Naga28,
                 NagaVersionConfig::Naga29 => NagaVersion::Naga29,
                 NagaVersionConfig::NagaMain => NagaVersion::NagaMain,
             },
+            tint_enabled: *self.diagnostics_external_tintErrors(),
+            tint_path: Some(tint_path.to_owned()),
         }
     }
 
@@ -907,6 +921,9 @@ fn field_props(
             "type": ["null", "integer"],
             "minimum": 0,
             "maximum": 0xFFFF,
+        },
+        "Option<String>" | "Option<Utf8PathBuf>" => set! {
+            "type": ["null", "string"],
         },
         "Option<bool>" => set! {
             "type": ["null", "boolean"],

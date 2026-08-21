@@ -1,12 +1,10 @@
 use expect_test::expect;
-use syntax::ExtensionsConfig;
 
 use crate::tests::check_infer;
 
 #[test]
 fn import_statement_simple() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -20,7 +18,6 @@ fn import_statement_simple() {
         const barValue = 3;
         ",
         expect![[r#"
-            ---
             32..38 'output': integer
             41..44 'bar': integer
             ---
@@ -36,7 +33,6 @@ fn import_statement_simple() {
 #[test]
 fn inline_import_simple() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         const bar = true;
@@ -48,7 +44,6 @@ fn inline_import_simple() {
         const bar = 4;
         ",
         expect![[r#"
-            ---
             6..9 'bar': bool
             12..16 'true': bool
             38..39 'a': i32
@@ -63,7 +58,6 @@ fn inline_import_simple() {
 #[test]
 fn import_super() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         const foo = 4;
@@ -80,7 +74,6 @@ fn import_super() {
         }
         ",
         expect![[r#"
-            ---
             6..9 'foo': integer
             12..13 '4': integer
             ---
@@ -100,7 +93,6 @@ fn import_super() {
 #[test]
 fn import_statement_cycle_allowed() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -111,7 +103,6 @@ fn import_statement_cycle_allowed() {
         const bar = 3;
         ",
         expect![[r#"
-            ---
             32..38 'output': integer
             41..44 'bar': integer
             ---
@@ -124,7 +115,6 @@ fn import_statement_cycle_allowed() {
 #[test]
 fn import_statement_cycle_error() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -135,10 +125,9 @@ fn import_statement_cycle_error() {
         const bar = output;
         ",
         expect![[r#"
+            26..45: cyclic definition for type `output`
             ---
-            CyclicType { name: Name("output"), range: 26..45 } in Body
-            ---
-            CyclicType { name: Name("bar"), range: 24..43 } in Body
+            24..43: cyclic definition for type `bar`
         "#]],
     );
 }
@@ -146,7 +135,6 @@ fn import_statement_cycle_error() {
 #[test]
 fn import_statement_inline() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         fn main() {
@@ -162,7 +150,6 @@ fn import_statement_inline() {
         fn barValue() -> f32 { return 3; }
         ",
         expect![[r#"
-            ---
             16..35 'packag...:bar()': f32
             41..72 'packag...alue()': f32
             ---
@@ -176,7 +163,6 @@ fn import_statement_inline() {
 #[test]
 fn cannot_import_imported_item() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         const b = package::foo::A; // this should fail, because A is not public
@@ -188,11 +174,10 @@ fn cannot_import_imported_item() {
         const A = 3;
         ",
         expect![[r#"
-            ---
             6..7 'b': [error]
             10..25 'package::foo::A': [error]
-            InvalidType { error: TypeLoweringError { container: Expression(Idx::<Expression>(0)), kind: UnresolvedPath { path: Path(ModPath("package::foo::A")), failed_segment: 2 } } } in Body
-            ExpectedLoweredKind { expression: Idx::<Expression>(0), expected: Variable, actual: Type, path: Path(ModPath("package::foo::A")) } in Body
+            10..25 'package::foo::A': `A` is private
+            10..25 'package::foo::A': expected variable, but got type `package::foo::A`
             ---
             ---
             6..7 'A': integer
@@ -204,7 +189,6 @@ fn cannot_import_imported_item() {
 #[test]
 fn import_statement_multiple_items() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::{foo, foo::bar, foo::utils::bar as boolBar};
@@ -221,7 +205,6 @@ fn import_statement_multiple_items() {
         const bar = true;
         ",
         expect![[r#"
-            ---
             80..87 'boolBar': bool
             103..106 'foo': i32
             109..117 'foo::bar': integer
@@ -240,7 +223,6 @@ fn import_statement_multiple_items() {
 #[test]
 fn import_statement_self_shadowing() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::shadows;
@@ -252,7 +234,6 @@ fn import_statement_self_shadowing() {
         const bar = 3;
         ",
         expect![[r#"
-            ---
             32..39 'shadows': integer
             42..43 '3': integer
             51..54 'foo': integer
@@ -265,26 +246,27 @@ fn import_statement_self_shadowing() {
 }
 
 #[test]
-fn import_statement_self_shadowing_error() {
+fn import_statement_package_and_local_same_name() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
-        import package::foo::bar; // this should fail, because
-        const foo = bar;          // package::foo resolves to this constant
+        import package::foo;
+        const foo = 3;
+        const bar = foo + foo::a;
 
         //- /foo.wesl
-        const bar = 3;
+        const a: u32 = 6;
         ",
         expect![[r#"
+            27..30 'foo': integer
+            33..34 '3': integer
+            42..45 'bar': u32
+            48..51 'foo': integer
+            48..60 'foo + foo::a': u32
+            54..60 'foo::a': u32
             ---
-            61..64 'foo': [error]
-            67..70 'bar': [error]
-            InvalidType { error: TypeLoweringError { container: Expression(Idx::<Expression>(0)), kind: UnresolvedPath { path: Path(ModPath("bar")), failed_segment: 0 } } } in Body
-            ExpectedLoweredKind { expression: Idx::<Expression>(0), expected: Variable, actual: Type, path: Path(ModPath("bar")) } in Body
-            ---
-            6..9 'bar': integer
-            12..13 '3': integer
+            6..7 'a': u32
+            15..16 '6': integer
         "#]],
     );
 }
@@ -292,7 +274,6 @@ fn import_statement_self_shadowing_error() {
 #[test]
 fn import_statement_local_shadows() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -307,7 +288,6 @@ fn import_statement_local_shadows() {
         const bar = 3;
         ",
         expect![[r#"
-            ---
             46..49 'bar': bool
             52..56 'true': bool
             65..70 'false': bool
@@ -323,7 +303,6 @@ fn import_statement_local_shadows() {
 #[test]
 fn import_statement_local_uses_and_shadows() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -336,7 +315,6 @@ fn import_statement_local_uses_and_shadows() {
         const bar = 3; // abstract int
         ",
         expect![[r#"
-            ---
             46..49 'bar': i32
             52..55 'bar': integer
             65..68 'foo': i32
@@ -353,7 +331,6 @@ fn import_statement_local_uses_and_shadows() {
 #[test]
 fn import_statement_shadows_submodule() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::bar;
@@ -366,7 +343,6 @@ fn import_statement_shadows_submodule() {
         const shadowed = 3;
         ",
         expect![[r#"
-            ---
             32..38 'output': integer
             41..44 'bar': integer
             ---
@@ -382,7 +358,6 @@ fn import_statement_shadows_submodule() {
 #[test]
 fn import_statement_shadows_predeclared() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /package.wesl edition:2026_pre
         import package::foo::{bar as vec2f, vec3f};
@@ -393,7 +368,6 @@ fn import_statement_shadows_predeclared() {
         alias vec3f = u32;
         ",
         expect![[r#"
-            ---
             50..56 'output': u32
             66..71 'vec2f': integer
             ---
@@ -406,7 +380,6 @@ fn import_statement_shadows_predeclared() {
 #[test]
 fn import_escapes_root() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /foo.wesl edition:2026_pre
         const_assert(super::super::MyType(3) == true);
@@ -416,7 +389,7 @@ fn import_escapes_root() {
             13..44 'super:...= true': [error]
             34..35 '3': integer
             40..44 'true': bool
-            InvalidType { error: TypeLoweringError { container: Expression(Idx::<Expression>(1)), kind: UnresolvedPath { path: Path(ModPath("super::super::MyType")), failed_segment: 0 } } } in Body
+            13..36 'super:...ype(3)': too many `super::`s
         "#]],
     );
 }
@@ -424,7 +397,6 @@ fn import_escapes_root() {
 #[test]
 fn import_nonexistent_module() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /foo.wesl edition:2026_pre
         struct Bar {
@@ -433,11 +405,10 @@ fn import_nonexistent_module() {
         const a = Bar(2);
         ",
         expect![[r#"
-            InvalidType { error: TypeLoweringError { container: TypeSpecifier(Idx::<TypeSpecifier>(0)), kind: UnresolvedPath { path: Path(ModPath("not_a_module::foo")), failed_segment: 0 } } } in Signature
-            47..48 'a': [error]
-            51..57 'Bar(2)': [error]
+            20..37 'not_a_...e::foo': package `not_a_module` not found
+            47..48 'a': Bar
+            51..57 'Bar(2)': Bar
             55..56 '2': integer
-            55..56 '2': expected [error] but got integer
         "#]],
     );
 }
@@ -445,7 +416,6 @@ fn import_nonexistent_module() {
 #[test]
 fn invalid_import_starting_with_item() {
     check_infer(
-        ExtensionsConfig::default(),
         "
         //- /foo.wesl edition:2026_pre
         const bar = 5;
@@ -458,8 +428,79 @@ fn invalid_import_starting_with_item() {
             12..13 '5': integer
             81..86 'fails': [error]
             89..97 'bar::nya': [error]
-            InvalidType { error: TypeLoweringError { container: Expression(Idx::<Expression>(0)), kind: UnresolvedPath { path: Path(ModPath("bar::nya")), failed_segment: 0 } } } in Body
-            ExpectedLoweredKind { expression: Idx::<Expression>(0), expected: Variable, actual: Type, path: Path(ModPath("bar::nya")) } in Body
+            89..97 'bar::nya': package `bar` not found
+            89..97 'bar::nya': expected variable, but got type `bar::nya`
+        "#]],
+    );
+}
+
+#[test]
+fn mod_path_super_display() {
+    check_infer(
+        "
+        //- /package.wesl edition:2026_pre
+        const Foo = f32(1.0);
+        //- /foo.wesl edition:2026_pre
+        //- /foo/bar.wesl edition:2026_pre
+        const fails = super::super::Foo::nya;
+        ",
+        expect![[r#"
+            6..9 'Foo': f32
+            12..20 'f32(1.0)': f32
+            16..19 '1.0': float
+            ---
+            ---
+            6..11 'fails': [error]
+            14..36 'super:...o::nya': [error]
+            14..36 'super:...o::nya': could not find file
+            14..36 'super:...o::nya': expected variable, but got type `super::super::Foo::nya`
+        "#]],
+    );
+}
+
+#[test]
+fn import_with_basic_dependency() {
+    check_infer(
+        "
+        //- /bar/package.wesl package:bar edition:2026_pre
+        const myValue = 3;
+
+        //- /foo/package.wesl package:foo edition:2026_pre dependencies:bar
+        const a = bar::myValue;
+        ",
+        expect![[r#"
+            6..13 'myValue': integer
+            16..17 '3': integer
+            ---
+            6..7 'a': integer
+            10..22 'bar::myValue': integer
+        "#]],
+    );
+}
+
+#[test]
+fn import_with_nested_dependency() {
+    check_infer(
+        "
+        //- /package.wesl package:my_shaders edition:2026_pre dependencies:nested
+        import nested;
+        const a = nested::myValue;
+
+        //- /foo.wesl
+        const a = nested::myValue;
+
+        //- /nested_shaders/package.wesl package:nested edition:2026_pre
+        const myValue = 3;
+        ",
+        expect![[r#"
+            21..22 'a': integer
+            25..40 'nested::myValue': integer
+            ---
+            6..7 'a': integer
+            10..25 'nested::myValue': integer
+            ---
+            6..13 'myValue': integer
+            16..17 '3': integer
         "#]],
     );
 }

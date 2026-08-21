@@ -8,19 +8,34 @@
 )]
 use std::fmt;
 
-use edition::{Edition, ExtensionsConfig};
+use edition::{Capabilities, Edition, ExtensionsConfig};
 use logos::Logos as _;
 use rowan::GreenNodeBuilder;
 
 use super::lexer::Token;
 use crate::{Parse, ParseEntryPoint, SyntaxKind, cst_builder::CstBuilder, lexer::lex};
 
+// cannot be in a submodule due to visibility of fields
 include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+enum TranslationUnitState {
+    #[default]
+    Imports,
+    Directives,
+    Declarations,
+}
 
 pub struct ParserContext {
     edition: Edition,
-    after_declarations: bool,
+    translation_unit_state: TranslationUnitState,
     extensions: ExtensionsConfig,
+    capabilities: Capabilities,
+
+    /// The most recently completed `attribute_list`.
+    /// Set by `create_node_attribute_list`.
+    /// Read by assertion callbacks that sit immediately after an `attribute_list` in the grammar.
+    last_attribute_list: Option<NodeRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,10 +47,10 @@ pub struct Diagnostic {
 impl fmt::Display for Diagnostic {
     fn fmt(
         &self,
-        f: &mut fmt::Formatter<'_>,
+        formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         write!(
-            f,
+            formatter,
             "error at {}..{}: {}",
             u32::from(self.range.start()),
             u32::from(self.range.end()),
@@ -51,10 +66,11 @@ pub(crate) fn to_range(span: Span) -> rowan::TextRange {
 }
 
 #[must_use]
-pub fn parse_entrypoint(
+pub fn parse_entrypoint_with_capabilities(
     input: &str,
     entrypoint: ParseEntryPoint,
     edition: Edition,
+    capabilities: Capabilities,
 ) -> Parse {
     let mut diagnostics = Vec::new();
     let parser = Parser::new_with_context(
@@ -62,8 +78,10 @@ pub fn parse_entrypoint(
         &mut diagnostics,
         ParserContext {
             edition,
-            after_declarations: false,
+            translation_unit_state: TranslationUnitState::default(),
             extensions: ExtensionsConfig::default(),
+            capabilities,
+            last_attribute_list: None,
         },
     );
     let parsed = match entrypoint {
@@ -105,6 +123,8 @@ impl Cst<'_> {
     }
 }
 
+const TRANSLATE_TIME_ATTRS: &[Rule] = &[Rule::IfAttr, Rule::ElifAttr, Rule::ElseAttr];
+
 impl Parser<'_> {
     fn is_func_call(&self) -> bool {
         // Skip past paths like `foo::bar::baz()`
@@ -121,6 +141,48 @@ impl Parser<'_> {
                 .next(),
             Some(Token::ParenthesisLeft | Token::TemplateStart)
         )
+    }
+
+    /// Checks the most recently completed `attribute_list` node (the one still on top of the
+    /// builder at the call site) for any attribute whose identifier is translate-time-only,
+    /// and returns a diagnostic for the first offender.
+    fn assert_no_translate_time_attrs(
+        &self,
+        context: &str,
+    ) -> Option<Diagnostic> {
+        let last_attribute_list = self.context.last_attribute_list?;
+        self.cst
+            .children(last_attribute_list)
+            .find_map(|child| match self.cst.get(child) {
+                Node::Rule(rule, _) => Some((
+                    match rule {
+                        Rule::IfAttr => "if",
+                        Rule::ElifAttr => "elif",
+                        Rule::ElseAttr => "else",
+                        _ => return None,
+                    },
+                    self.cst.span(child),
+                )),
+                _ => None,
+            })
+            .map(|(name, span)| Diagnostic {
+                message: format!("translate-time attribute `@{name}` is not allowed on {context}"),
+                range: to_range(span),
+            })
+    }
+
+    fn assert_attribute_list_empty(
+        &self,
+        list: Option<NodeRef>,
+        message: &str,
+    ) -> Option<Diagnostic> {
+        let list = list?;
+        // attribute_list has no children when empty
+        self.cst.children(list).next()?;
+        Some(Diagnostic {
+            message: message.to_string(),
+            range: to_range(self.cst.span(list)),
+        })
     }
 }
 
@@ -266,15 +328,68 @@ impl<'source> ParserCallbacks<'source> for Parser<'source> {
     ) {
         let text = &self.cst.source()[self.cst.span(node_ref)];
         match text {
-            "SHADER_INT64" => self.context.extensions.shader_int64 = true,
-            "EARLY_DEPTH_TEST" => self.context.extensions.early_depth_test = true,
             "f16" => self.context.extensions.f16 = true,
             "clip_distances" => self.context.extensions.clip_distances = true,
             "dual_source_blending" => self.context.extensions.dual_source_blending = true,
+            "subgroups" => self.context.extensions.subgroups = true,
+            "primitive_index" => self.context.extensions.primitive_index = true,
+            "subgroup_size_control" => self.context.extensions.subgroup_size_control = true,
+
+            "wgpu_mesh_shader" => self.context.extensions.wgpu_mesh_shader = true,
+            "wgpu_ray_query" => self.context.extensions.wgpu_ray_query = true,
+            "wgpu_ray_query_vertex_return" => {
+                self.context.extensions.wgpu_ray_query_vertex_return = true
+            },
+            "wgpu_ray_tracing_pipelines" => {
+                self.context.extensions.wgpu_ray_tracing_pipelines = true
+            },
+            "wgpu_int16" => self.context.extensions.wgpu_int16 = true,
+            "wgpu_cooperative_matrix" => self.context.extensions.wgpu_cooperative_matrix = true,
+            "per_vertex" => self.context.extensions.per_vertex = true,
+            "draw_index" => self.context.extensions.draw_index = true,
+            "wgpu_binding_array" => self.context.extensions.wgpu_binding_array = true,
             _ => {
                 diagnostics.push(self.create_diagnostic(
                     self.cst.span(node_ref),
-                    format!("unknown extension {text}"),
+                    format!("unknown extension: `{text}`"),
+                ));
+            },
+        }
+    }
+
+    fn create_node_language_extension_name(
+        &mut self,
+        node_ref: NodeRef,
+        diagnostics: &mut Vec<Self::Diagnostic>,
+    ) {
+        let text = &self.cst.source()[self.cst.span(node_ref)];
+        match text {
+            "readonly_and_readwrite_storage_textures" => {
+                self.context
+                    .extensions
+                    .readonly_and_readwrite_storage_textures = true
+            },
+            "packed_4x8_integer_dot_product" => {
+                self.context.extensions.packed_4x8_integer_dot_product = true
+            },
+            "unrestricted_pointer_parameters" => {
+                self.context.extensions.unrestricted_pointer_parameters = true
+            },
+            "pointer_composite_access" => self.context.extensions.pointer_composite_access = true,
+            "uniform_buffer_standard_layout" => {
+                self.context.extensions.uniform_buffer_standard_layout = true
+            },
+            "subgroup_id" => self.context.extensions.subgroup_id = true,
+            "subgroup_uniformity" => self.context.extensions.subgroup_uniformity = true,
+            "texture_and_sampler_let" => self.context.extensions.texture_and_sampler_let = true,
+            "texture_formats_tier1" => self.context.extensions.texture_formats_tier1 = true,
+            "linear_indexing" => self.context.extensions.linear_indexing = true,
+            "immediate_address_space" => self.context.extensions.immediate_address_space = true,
+            "buffer_view" => self.context.extensions.buffer_view = true,
+            _ => {
+                diagnostics.push(self.create_diagnostic(
+                    self.cst.span(node_ref),
+                    format!("unknown extension: `{text}`"),
                 ));
             },
         }
@@ -285,7 +400,7 @@ impl<'source> ParserCallbacks<'source> for Parser<'source> {
         node_ref: NodeRef,
         diagnostics: &mut Vec<Self::Diagnostic>,
     ) {
-        if !self.context.extensions.early_depth_test {
+        if !self.context.capabilities.early_depth_test {
             diagnostics.push(self.create_diagnostic(
                 self.cst.span(node_ref),
                 "the extension EARLY_DEPTH_TEST is not enabled".to_owned(),
@@ -341,24 +456,119 @@ impl<'source> ParserCallbacks<'source> for Parser<'source> {
         None
     }
 
-    /// Called when semantic action `#2` in rule `global_item` is visited.
-    fn action_global_item_2(
-        &mut self,
-        diags: &mut Vec<Self::Diagnostic>,
-    ) {
-        self.context.after_declarations = true;
-    }
-
-    /// Called when semantic action `#1` in rule `global_item` is visited.
+    /// Called when an import is visited.
     fn action_global_item_1(
         &mut self,
         diags: &mut Vec<Self::Diagnostic>,
     ) {
-        if self.context.after_declarations {
+        if self.context.translation_unit_state > TranslationUnitState::Imports {
             diags.push(self.create_diagnostic(
                 self.span(),
-                "directives must come before other items".to_owned(),
+                "import statements must come before other items".to_owned(),
+            ));
+        } else {
+            self.context.translation_unit_state = TranslationUnitState::Imports;
+        }
+    }
+
+    /// Called when a directive is visited.
+    fn action_global_item_2(
+        &mut self,
+        diags: &mut Vec<Self::Diagnostic>,
+    ) {
+        if self.context.translation_unit_state > TranslationUnitState::Directives {
+            diags.push(self.create_diagnostic(
+                self.span(),
+                "directives must come before declarations".to_owned(),
+            ));
+        } else {
+            self.context.translation_unit_state = TranslationUnitState::Directives;
+        }
+    }
+
+    /// Called when a declaration is visited.
+    fn action_global_item_3(
+        &mut self,
+        _diags: &mut Vec<Self::Diagnostic>,
+    ) {
+        self.context.translation_unit_state = TranslationUnitState::Declarations;
+    }
+
+    // attribute validation
+
+    fn create_node_attribute_list(
+        &mut self,
+        node_ref: NodeRef,
+        diagnostics: &mut Vec<Self::Diagnostic>,
+    ) {
+        self.context.last_attribute_list = Some(node_ref);
+    }
+
+    fn assertion_return_type_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a function return type")
+    }
+
+    fn assertion_global_declaration_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a function body")
+    }
+
+    fn assertion_statement_0(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a switch body")
+    }
+
+    fn assertion_default_alone_clause_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a switch case clause body")
+    }
+
+    fn assertion_case_clause_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a switch default clause body")
+    }
+
+    fn assertion_statement_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a loop body")
+    }
+
+    fn assertion_statement_2(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a for body")
+    }
+
+    fn assertion_statement_3(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a while body")
+    }
+
+    fn assertion_if_clause_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("an if/else body")
+    }
+
+    fn assertion_else_if_clause_1(&self) -> Option<Self::Diagnostic> {
+        self.assert_no_translate_time_attrs("an if/else body")
+    }
+
+    fn assertion_else_clause_1(&self) -> Option<Self::Diagnostic> {
+        self.assert_no_translate_time_attrs("an if/else body")
+    }
+
+    fn assertion_continuing_statement_1(&self) -> Option<Diagnostic> {
+        self.assert_no_translate_time_attrs("a continuing body")
+    }
+
+    fn assertion_continuing_compound_statement_1(&self) -> Option<Self::Diagnostic> {
+        if self.peek(0) == Token::BraceRight {
+            return Some(self.create_diagnostic(
+                self.span(),
+                "attributes must precede a statement here".to_owned(),
             ));
         }
+        None
+    }
+
+    fn assertion_loop_compound_statement_1(&self) -> Option<Self::Diagnostic> {
+        if !matches!(self.current, Token::Continuing | Token::BraceRight) {
+            return None;
+        }
+        self.assert_attribute_list_empty(
+            self.context.last_attribute_list,
+            "attributes must precede a statement here",
+        )
     }
 }

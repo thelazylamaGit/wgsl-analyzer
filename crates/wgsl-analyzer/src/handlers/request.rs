@@ -5,8 +5,8 @@
 )]
 
 use base_db::{FilePosition, FileRange, TextRange};
-use hir::diagnostics::DiagnosticsConfig;
-use ide::{Cancellable, HoverAction, HoverGotoTypeData, diagnostics::Severity};
+use ide::{Cancellable, HoverAction, HoverGotoTypeData};
+use ide_diagnostics::DiagnosticsConfig;
 use lsp_types::{
     CompletionList, CompletionParams, CompletionResponse, Contents, Definition, DefinitionParams,
     DefinitionResponse, Diagnostic, DiagnosticRelatedInformation, DiagnosticSeverity,
@@ -244,7 +244,11 @@ pub(crate) fn handle_signature_help(
         &snap,
         &parameters.text_document_position_params
     )?);
-    let active_signature = if snap.config.capabilities().signature_help_context_support() {
+    let active_signature = if snap
+        .config
+        .client_capabilities()
+        .signature_help_context_support()
+    {
         parameters
             .context
             .expect("we checked that it is supported")
@@ -400,13 +404,6 @@ pub(crate) fn publish_diagnostics(
             Ok(lsp_diagnostic)
         })
         .collect()
-}
-
-const fn diagnostic_severity(severity: Severity) -> DiagnosticSeverity {
-    match severity {
-        Severity::Error => DiagnosticSeverity::Error,
-        Severity::WeakWarning => DiagnosticSeverity::Hint,
-    }
 }
 
 fn prepare_hover_actions(

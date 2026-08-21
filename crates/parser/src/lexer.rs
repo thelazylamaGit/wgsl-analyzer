@@ -316,7 +316,7 @@ impl Iterator for WgslLexer<'_, '_> {
                     "super" if self.edition.at_least_wesl_0_0_1() => Token::Super,
                     "as" if self.edition.at_least_wesl_0_0_1() => Token::As,
 
-                    // Context-dependent attribute keywords
+                    // Context-dependent attribute enums and identifiers
                     "align" if self.inner.extras.after_at => Token::Align,
                     "binding" if self.inner.extras.after_at => Token::Binding,
                     "blend_src" if self.inner.extras.after_at => Token::BlendSrc,
@@ -335,6 +335,9 @@ impl Iterator for WgslLexer<'_, '_> {
                     "vertex" if self.inner.extras.after_at => Token::Vertex,
                     "fragment" if self.inner.extras.after_at => Token::Fragment,
                     "compute" if self.inner.extras.after_at => Token::Compute,
+                    "elif" if self.inner.extras.after_at && self.edition.at_least_wesl_0_0_1() => {
+                        Token::Elif
+                    },
 
                     // Context-dependent attribute arguments
                     "flat" if self.inner.extras.after_interpolate => Token::Flat,

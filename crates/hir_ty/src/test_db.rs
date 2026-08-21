@@ -1,14 +1,12 @@
 use std::{fmt, panic, sync::Mutex};
 
 use base_db::{
-    EditionedFileId, FileSourceRootInput, FileText, Nonce, SourceDatabase, SourceRootId,
-    SourceRootInput, change::Change, input::SourceRoot, set_all_packages_with_durability,
+    CapabilitiesInput, FileSourceRootInput, FileText, Nonce, SourceDatabase, SourceRootId,
+    SourceRootInput, input::SourceRoot, set_all_packages_with_durability,
 };
-use hir_def::database::DefDatabase as _;
 use salsa::{Database as _, Durability};
-use syntax::{Edition, ExtensionsConfig};
+use syntax::Capabilities;
 use triomphe::Arc;
-use vfs::{AnchoredPath, FileId, VfsPath, file_set::FileSet};
 
 #[salsa_macros::db]
 pub(crate) struct TestDatabase {
@@ -17,10 +15,11 @@ pub(crate) struct TestDatabase {
     events: Arc<Mutex<Option<Vec<salsa::Event>>>>,
     nonce: Nonce,
 }
+
 impl Default for TestDatabase {
     fn default() -> Self {
         let events = Arc::<Mutex<Option<Vec<salsa::Event>>>>::default();
-        let mut value = Self {
+        let mut db = Self {
             storage: salsa::Storage::new(Some(Box::new({
                 let events = events.clone();
                 move |event| {
@@ -34,10 +33,10 @@ impl Default for TestDatabase {
             events,
             nonce: Nonce::new(),
         };
-        value.set_extensions_with_durability(ExtensionsConfig::none(), Durability::MEDIUM);
+        CapabilitiesInput::update_capabilities(&mut db, Capabilities::default());
         // This needs to be here otherwise the first `Change` will panic.
-        set_all_packages_with_durability(&mut value, [], Durability::LOW);
-        value
+        set_all_packages_with_durability(&mut db, [], Durability::LOW);
+        db
     }
 }
 
@@ -55,9 +54,9 @@ impl Clone for TestDatabase {
 impl fmt::Debug for TestDatabase {
     fn fmt(
         &self,
-        f: &mut fmt::Formatter<'_>,
+        formatter: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        f.debug_struct("TestDatabase").finish()
+        formatter.debug_struct("TestDatabase").finish()
     }
 }
 
@@ -169,6 +168,7 @@ impl TestDatabase {
                 salsa::EventKind::DidValidateMemoizedValue { .. }
                 | salsa::EventKind::WillBlockOn { .. }
                 | salsa::EventKind::WillIterateCycle { .. }
+                | salsa::EventKind::DidFinalizeCycle { .. }
                 | salsa::EventKind::WillCheckCancellation
                 | salsa::EventKind::DidSetCancellationFlag
                 | salsa::EventKind::WillDiscardStaleOutput { .. }

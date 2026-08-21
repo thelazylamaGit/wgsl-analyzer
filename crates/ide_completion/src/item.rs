@@ -82,7 +82,8 @@ pub struct CompletionItemLabel {
     pub detail_right: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The type of the completion item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CompletionItemKind {
     Field,
     Function,
@@ -93,6 +94,46 @@ pub enum CompletionItemKind {
     Struct,
     Module,
     TypeAlias,
+    Builtin(BuiltInKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BuiltInKind {
+    Alias,
+    Constructor,
+    Declaration,
+    Enumerant,
+    Function,
+    Struct,
+    TypeGenerator,
+    Type,
+}
+
+impl CompletionItemKind {
+    #[must_use]
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Field => "field",
+            Self::Function => "function",
+            Self::Variable => "variable",
+            Self::Keyword => "keyword",
+            Self::Snippet => "snippet",
+            Self::Constant => "constant",
+            Self::Struct => "struct",
+            Self::Module => "module",
+            Self::TypeAlias => "type alias",
+            Self::Builtin(kind) => match kind {
+                BuiltInKind::Alias => "builtin alias",
+                BuiltInKind::Constructor => "builtin constructor",
+                BuiltInKind::Declaration => "builtin declaration",
+                BuiltInKind::Enumerant => "builtin enumerant",
+                BuiltInKind::Function => "builtin function",
+                BuiltInKind::Struct => "builtin struct",
+                BuiltInKind::TypeGenerator => "builtin type generator",
+                BuiltInKind::Type => "builtin type",
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -484,7 +525,7 @@ impl fmt::Debug for CompletionItem {
 impl Builder {
     pub(crate) fn build(
         self,
-        database: &RootDatabase,
+        db: &RootDatabase,
     ) -> CompletionItem {
         let _p = tracing::info_span!("item::Builder::build").entered();
 
@@ -522,7 +563,7 @@ impl Builder {
         //         detail_left,
         //         "{}(use {})",
         //         if detail_left.is_empty() { "" } else { " " },
-        //         import_edit.import_path.display(database, self.edition)
+        //         import_edit.import_path.display(db, self.edition)
         //     );
         // } else if let Some(trait_name) = self.trait_name {
         //     let detail_left = detail_left.get_or_insert_with(String::new);
@@ -541,7 +582,7 @@ impl Builder {
         // let import_to_add = self
         //     .imports_to_add
         //     .into_iter()
-        //     .map(|import| import.import_path.display(database, self.edition).to_string())
+        //     .map(|import| import.import_path.display(db, self.edition).to_string())
         //     .collect();
 
         CompletionItem {
