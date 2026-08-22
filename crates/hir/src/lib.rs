@@ -22,7 +22,7 @@ use hir_def::{
     resolver::Resolver,
     signature::{FieldId, FunctionSignature, ParameterId, StructSignature, TypeAliasSignature},
 };
-use hir_ty::{infer::InferenceResult, ty::Type};
+use hir_ty::{function::FunctionDetails, infer::InferenceResult, ty::Type};
 use smallvec::SmallVec;
 use stdx::impl_from;
 use syntax::{AstNode as _, HasName as _, SyntaxNode, ast, pointer::AstPointer};
@@ -590,6 +590,16 @@ impl HasSource for Parameter {
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
 pub struct Function {
     id: FunctionId,
+}
+
+impl Function {
+    #[must_use]
+    pub fn details(
+        self,
+        db: &dyn HirDatabase,
+    ) -> &FunctionDetails {
+        db.function_type(self.id).lookup(db)
+    }
 }
 
 impl HasSource for Function {

@@ -21,6 +21,7 @@ smallvec.workspace = true
 smol_str.workspace = true
 tracing.workspace = true
 triomphe.workspace = true
+wgsl-types.workspace = true
 # local dependencies
 ide-completion.workspace = true
 ide-diagnostics.workspace = true

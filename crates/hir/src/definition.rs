@@ -5,8 +5,8 @@ use hir_def::{
 use syntax::{AstNode as _, SyntaxNode, SyntaxToken, ast, match_ast};
 
 use crate::{
-    Field, Function, GlobalConstant, GlobalVariable, Local, ModuleDef, Override, Semantics, Struct,
-    TypeAlias,
+    ChildContainer, Field, Function, GlobalConstant, GlobalVariable, Local, ModuleDef, Override,
+    Semantics, Struct, TypeAlias,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +46,9 @@ impl Definition {
                 ast::FieldExpression(field_expression) => {
                     resolve_field(semantics, file_id, field_expression)
                 },
+                ast::Name(name) => {
+                    resolve_declaration_name(semantics, file_id, &name)
+                },
                 _ => {
                     tracing::warn!("attempted to go to definition {:?}", node);
                     None
@@ -53,6 +56,18 @@ impl Definition {
             }
         }
     }
+}
+
+fn resolve_declaration_name(
+    semantics: &Semantics<'_>,
+    file_id: EditionedFileId,
+    name: &ast::Name,
+) -> Option<Definition> {
+    ast::FunctionDeclaration::cast(name.syntax().parent()?)?;
+    let ChildContainer::FunctionId(id) = semantics.find_container(file_id, name.syntax())? else {
+        return None;
+    };
+    Some(Definition::ModuleDef(ModuleDef::Function(Function { id })))
 }
 
 impl From<ResolveKind> for Definition {
